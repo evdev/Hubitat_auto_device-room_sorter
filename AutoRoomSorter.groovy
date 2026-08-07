@@ -14,7 +14,7 @@
  *
  * Never uses /device/updateRoom (name-based; can create junk rooms).
  *
- * Version: 1.0.0
+ * Version: 1.0.1
  */
 
 definition(
@@ -130,9 +130,26 @@ def roomsPage() {
                 paragraph "No rooms detected from device labels yet. Add a custom room below, or go to Step 2 if your hub rooms already exist."
             }
             plan.eachWithIndex { room, idx ->
-                def status = room.hubRoomId ? "Exists — will reuse" : "New — will create"
-                def color = room.hubRoomId ? "green" : "orange"
+                def included = roomIncludeValue(idx, room)
+                def status
+                def color
+                if (room.hubRoomId) {
+                    status = "Exists — will reuse"
+                    color = "green"
+                } else if (!included) {
+                    status = "New — skipped (unchecked)"
+                    color = "#888"
+                } else {
+                    status = "New — will create"
+                    color = "orange"
+                }
                 paragraph "<b>${room.canonicalName}</b> — <span style='color:${color};'>${status}</span> · ${room.matchCount ?: 0} matching device(s)"
+                if (!room.hubRoomId) {
+                    input "roomInclude_${idx}", "bool",
+                        title: "Create this room",
+                        defaultValue: true,
+                        submitOnChange: true
+                }
                 if (room.hubRoomId) {
                     paragraph "Name (read-only): ${room.canonicalName}"
                 } else {
@@ -368,6 +385,13 @@ def refreshScanIntoState() {
     def matchPreview = []
     devices.findAll { !it.roomId }.each { device ->
         def result = matchDeviceToPlan(device.name, plan)
+        // Unchecked New rooms are excluded from create and from auto-sort proposals
+        if (result) {
+            def planRoom = plan.find { normalizeLabel(it.canonicalName) == normalizeLabel(result.canonicalName) }
+            if (planRoom && planRoom.include == false && !planRoom.hubRoomId) {
+                result = null
+            }
+        }
         matchPreview << [
             deviceId: device.id,
             deviceName: device.name,
@@ -472,6 +496,7 @@ def mergePlanWithDetections(devices, seeded, hubRooms) {
         def nkey = normalizeLabel(entry.canonicalName)
         def prev = previous[nkey]
         if (prev?.aliases) entry.aliases = prev.aliases
+        if (prev?.include != null) entry.include = prev.include
         if (prev?.canonicalName && !entry.hubRoomId) {
             entry.canonicalName = prev.canonicalName
             entry.userAdded = prev.userAdded
@@ -510,6 +535,9 @@ def applyRoomPageEdits() {
         if (!room.hubRoomId) {
             def newName = settings["roomName_${idx}"]
             if (newName) room.canonicalName = newName.toString().trim()
+            room.include = roomIncludeValue(idx, room)
+        } else {
+            room.include = true
         }
         def aliasStr = settings["roomAliases_${idx}"]
         if (aliasStr != null) {
@@ -518,6 +546,13 @@ def applyRoomPageEdits() {
         }
     }
     state.roomPlan = plan
+}
+
+boolean roomIncludeValue(idx, room = null) {
+    def setting = settings["roomInclude_${idx}"]
+    if (setting != null) return setting != false
+    if (room?.include != null) return room.include != false
+    true
 }
 
 def handleAddRoomButton() {
@@ -543,7 +578,8 @@ def handleAddRoomButton() {
         hubRoomId: existing?.id as Long,
         fromHub: !!existing,
         matchCount: 0,
-        userAdded: true
+        userAdded: true,
+        include: true
     ]
     state.roomPlan = plan.sort { it.canonicalName?.toLowerCase() }
     app.updateSetting("addRoomName", [type: "text", value: ""])
@@ -578,6 +614,10 @@ def handleCreateRooms() {
     plan.each { room ->
         if (room.hubRoomId) {
             lines << "SKIP (exists): ${room.canonicalName} id=${room.hubRoomId}"
+            return
+        }
+        if (room.include == false) {
+            lines << "SKIP (unchecked): ${room.canonicalName}"
             return
         }
         try {
