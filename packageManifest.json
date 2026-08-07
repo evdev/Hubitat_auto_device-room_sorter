@@ -1,0 +1,25 @@
+{
+  "packageName": "Auto Room Sorter",
+  "minimumHEVersion": "2.3.0",
+  "author": "Ephrayim",
+  "version": "1.0.0",
+  "dateReleased": "2026/08/07",
+  "releaseNotes": "Initial release: detect room names in device labels, create missing rooms, sort unassigned devices with preview/exclusions/leftovers and one-level undo.",
+  "documentationLink": "https://github.com/evdev/Hubitat_auto_device-room_sorter",
+  "category": "Convenience",
+  "tags": [
+    "Tools & Utilities",
+    "Automations & Groups"
+  ],
+  "apps": [
+    {
+      "id": "03962e78-3439-4f8f-b515-3d1a5724751f",
+      "name": "Auto Room Sorter",
+      "namespace": "ephrayim",
+      "location": "https://raw.githubusercontent.com/evdev/Hubitat_auto_device-room_sorter/main/AutoRoomSorter.groovy",
+      "required": true,
+      "oauth": false,
+      "primary": true
+    }
+  ]
+}

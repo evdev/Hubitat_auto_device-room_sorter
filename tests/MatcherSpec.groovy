@@ -1,0 +1,174 @@
+/**
+ * Local matcher tests for AutoRoomSorter.groovy
+ *
+ * Run from repo root: groovy tests/MatcherSpec.groovy
+ */
+
+import groovy.json.JsonSlurper
+import org.codehaus.groovy.control.CompilerConfiguration
+
+abstract class HubitatStubScript extends Script {
+    Map state = [:]
+    Map settings = [:]
+    Expando app = new Expando(updateSetting: { String n, Map v -> settings[n] = v.value })
+    Expando log = new Expando(
+        debug: { Object m -> },
+        info: { Object m -> },
+        warn: { Object m -> System.err.println("WARN: $m") },
+        error: { Object m -> System.err.println("ERROR: $m") }
+    )
+
+    def definition(Map m) { }
+    def preferences(Closure c) { }
+    def page(Object... args) { }
+    def dynamicPage(Object... args) { }
+    def section(Object... args) { }
+    def input(Object... args) { }
+    def href(Object... args) { }
+    def paragraph(Object... args) { }
+
+    def propertyMissing(String name) { settings[name] }
+    def propertyMissing(String name, value) { settings[name] = value }
+}
+
+def projectRoot = new File(System.getProperty("user.dir"))
+def appFile = new File(projectRoot, "AutoRoomSorter.groovy")
+if (!appFile.exists()) {
+    throw new FileNotFoundException("Cannot find AutoRoomSorter.groovy in ${projectRoot}")
+}
+
+def config = new CompilerConfiguration()
+config.scriptBaseClass = HubitatStubScript.name
+def shell = new GroovyShell(HubitatStubScript.classLoader, new Binding(), config)
+def script = shell.parse(appFile)
+script.run()
+
+def fixturesDir = new File(projectRoot, "tests/fixtures")
+def devices = new JsonSlurper().parse(new File(fixturesDir, "device-labels.json"))
+def rooms = new JsonSlurper().parse(new File(fixturesDir, "rooms.json"))
+
+int failures = 0
+int assertions = 0
+
+def assertEq = { Object actual, Object expected, String msg ->
+    assertions++
+    if (actual != expected) {
+        failures++
+        println "FAIL: ${msg} — expected=${expected} actual=${actual}"
+    }
+}
+
+def assertTrue = { boolean cond, String msg ->
+    assertions++
+    if (!cond) {
+        failures++
+        println "FAIL: ${msg}"
+    }
+}
+
+assertEq script.normalizeLabel("Saadya's Room Light"), "saadyas room light", "apostrophe strip"
+assertEq script.normalizeLabel("Backyard_Left_Side"), "backyard left side", "underscores"
+assertEq script.normalizeLabel("Temp & Humidity"), "temp humidity", "ampersand"
+assertEq script.normalizeLabel("  Living   Room  "), "living room", "collapse space"
+
+def catalog = script.roomCatalog()
+def seeded = rooms.collect { hr ->
+    def aliases = [hr.name] as LinkedHashSet
+    catalog.each { catName, catAliases ->
+        if (script.normalizeLabel(catName) == script.normalizeLabel(hr.name)) {
+            catAliases.each { aliases << it }
+        }
+    }
+    [
+        key: hr.name,
+        canonicalName: hr.name,
+        aliases: aliases as List,
+        hubRoomId: hr.id as Long
+    ]
+}
+def seen = seeded.collect { script.normalizeLabel(it.canonicalName) } as Set
+def targets = [] + seeded
+catalog.each { name, aliases ->
+    def nkey = script.normalizeLabel(name)
+    if (seen.contains(nkey)) return
+    targets << [
+        key: name,
+        canonicalName: name,
+        aliases: ([name] + aliases) as List,
+        hubRoomId: null
+    ]
+}
+
+def matchName = { String label ->
+    script.matchLabelAgainstTargets(label, targets)?.canonicalName
+}
+
+assertEq matchName("Laundry Washer"), "Laundry Room", "Laundry Washer"
+assertEq matchName("Laundry Dryer"), "Laundry Room", "Laundry Dryer"
+assertEq matchName("Basement AC"), "Basement", "Basement AC"
+assertEq matchName("Kitchen Echo"), "Kitchen", "Kitchen Echo"
+assertEq matchName("Saadya's Room Light"), "Saadya's Room", "Saadya possessive"
+assertEq matchName("Backyard_Left_Side"), "Backyard", "Backyard underscore"
+assertEq matchName("Backyard_Right_Side"), "Backyard", "Backyard right"
+assertEq matchName("Outdoor Temp & Humidity Sensor"), "Outside", "Outdoor → Outside via alias"
+assertEq matchName("Outdoor Temperature Humidity"), "Outside", "Outdoor temperature"
+assertEq matchName("Deck String Lights"), "Deck", "Deck"
+assertEq matchName("Front Porch Keypad LED 1"), "Front Porch", "Front Porch"
+assertEq matchName("Garage Floodlight Camera Floodlight"), "Garage", "Garage"
+assertEq matchName("Dining Room Lights"), "Dining Room", "Dining Room existing"
+
+assertEq matchName("Master Bathroom Fan"), "Master Bathroom", "Master Bathroom beats Bedroom"
+assertEq matchName("Master Bedroom Lamp"), "Master Bedroom", "Master Bedroom"
+
+[
+    "Bridge#112 Device#01",
+    "Device (1)",
+    "Efraim's Phone",
+    "Downstairs Lights",
+    "Front Door Camera",
+    "Pixel 7",
+    "Bug Zapper",
+    "Dashboard Notifications",
+    "Shelly WiFi v2 Switch - shelly1pmg3-dcda0cdf6808"
+].each { label ->
+    assertEq matchName(label), null, "negative: ${label}"
+}
+
+assertEq matchName("Garden Fountain"), "Garden", "Garden is fine"
+assertTrue matchName("Garden Fountain") != "Den", "garden must not match Den"
+
+def masterOnly = script.matchLabelAgainstTargets("Master Closet Light", targets)
+assertTrue masterOnly == null || script.normalizeLabel(masterOnly.matchedAlias) != "master",
+    "must not match via bare alias 'master'"
+
+def warns = script.validateAliasList("master, lr, room, kitchen")
+assertTrue warns.any { it.toLowerCase().contains("master") }, "warn bare master"
+assertTrue warns.any { it.contains("3 characters") }, "warn short lr"
+assertTrue warns.any { it.toLowerCase().contains("'room'") || it.contains("room") }, "warn denied room"
+
+println ""
+println "=== Match report (unassigned devices) ==="
+def unassigned = devices.findAll { !it.roomId }
+def matched = 0
+unassigned.sort { it.name }.each { d ->
+    def r = script.matchLabelAgainstTargets(d.name, targets)
+    if (r) {
+        matched++
+        def amb = r.ambiguous ? " AMBIGUOUS" : ""
+        println sprintf("  %-45s → %-20s (%s)%s", d.name, r.canonicalName, r.matchedAlias, amb)
+    }
+}
+println "Matched ${matched} / ${unassigned.size()} unassigned"
+println ""
+
+def ambTargets = [
+    [canonicalName: "Alpha Room", aliases: ["alpha room", "shared"], hubRoomId: 1],
+    [canonicalName: "Beta Room", aliases: ["beta room", "shared"], hubRoomId: 2]
+]
+def amb = script.matchLabelAgainstTargets("Shared Light", ambTargets)
+assertTrue amb?.ambiguous == true, "shared alias should be ambiguous"
+assertTrue amb?.canonicalName in ["Alpha Room", "Beta Room"], "ambiguous still picks a candidate"
+
+println "Assertions: ${assertions}, failures: ${failures}"
+if (failures > 0) System.exit(1)
+println "ALL PASSED"

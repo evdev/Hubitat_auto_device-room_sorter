@@ -1,0 +1,70 @@
+[
+  {
+    "id": 15,
+    "name": "Attic"
+  },
+  {
+    "id": 13,
+    "name": "Basement"
+  },
+  {
+    "id": 5,
+    "name": "Dining Room"
+  },
+  {
+    "id": 8,
+    "name": "Foyer"
+  },
+  {
+    "id": 16,
+    "name": "Hallways"
+  },
+  {
+    "id": 9,
+    "name": "Kitchen"
+  },
+  {
+    "id": 6,
+    "name": "Laundry Room"
+  },
+  {
+    "id": 10,
+    "name": "Living Room"
+  },
+  {
+    "id": 4,
+    "name": "Master Bathroom"
+  },
+  {
+    "id": 2,
+    "name": "Master Bedroom"
+  },
+  {
+    "id": 3,
+    "name": "Nursery"
+  },
+  {
+    "id": 1,
+    "name": "Office"
+  },
+  {
+    "id": 7,
+    "name": "Outside"
+  },
+  {
+    "id": 17,
+    "name": "Powder Room"
+  },
+  {
+    "id": 11,
+    "name": "Saadya's Room"
+  },
+  {
+    "id": 12,
+    "name": "Shulamit's Room"
+  },
+  {
+    "id": 14,
+    "name": "Study"
+  }
+]
