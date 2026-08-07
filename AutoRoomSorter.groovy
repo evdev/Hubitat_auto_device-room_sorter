@@ -14,7 +14,7 @@
  *
  * Never uses /device/updateRoom (name-based; can create junk rooms).
  *
- * Version: 1.0.1
+ * Version: 1.0.2
  */
 
 definition(
@@ -204,7 +204,12 @@ def previewPage() {
     refreshScanIntoState()
     def matches = (state.matchPreview ?: []).findAll { it.proposedRoomKey }
     def byRoom = matches.groupBy { it.proposedRoomName }
-    def excludeOptions = matches.collectEntries { row ->
+    def roomOrder = byRoom.keySet().sort { it?.toLowerCase() }
+    state.sortRoomOrder = roomOrder
+    applySortRoomIncludes()
+    def excludeOptions = matches.findAll { row ->
+        sortRoomIncluded(row.proposedRoomName)
+    }.collectEntries { row ->
         def suffix = row.ambiguous ? " (ambiguous)" : ""
         [(row.deviceId.toString()): "${row.deviceName} → ${row.proposedRoomName}${suffix}"]
     }
@@ -219,18 +224,27 @@ def previewPage() {
             if (!byRoom) {
                 paragraph "No automatic matches among unassigned devices. Use Leftovers to assign manually, or adjust aliases in Step 1."
             } else {
-                byRoom.sort { it.key?.toLowerCase() }.each { roomName, devices ->
+                paragraph "Uncheck a room to skip sorting any devices into it. You can still exclude individual devices below."
+                roomOrder.each { roomName ->
+                    def devices = byRoom[roomName]
+                    def included = sortRoomIncluded(roomName)
+                    def status = included ? "will sort" : "skipped"
+                    def color = included ? "green" : "#888"
+                    input sortRoomSettingName(roomName), "bool",
+                        title: "Sort devices into ${roomName}",
+                        defaultValue: true,
+                        submitOnChange: true
                     def lines = devices.collect { d ->
                         def flag = d.ambiguous ? " ⚠ ambiguous" : ""
                         def missing = !d.proposedRoomId ? " (room not created)" : ""
                         "• ${escapeHtml(d.deviceName)}${flag}${missing}"
                     }.join("<br>")
-                    paragraph "<b>${escapeHtml(roomName)}</b> (${devices.size()})<br>${lines}"
+                    paragraph "<span style='color:${color};'>${devices.size()} device(s) — ${status}</span><br>${lines}"
                 }
             }
         }
 
-        section("Exclusions") {
+        section("Device exclusions") {
             input "excludedDeviceIds", "enum", title: "Exclude these matched devices from sorting",
                 options: excludeOptions, multiple: true, required: false
         }
@@ -350,6 +364,7 @@ def appButtonHandler(btn) {
 
 def updated() {
     applyRoomPageEdits()
+    applySortRoomIncludes()
     if (acknowledgedRisk) state.acknowledgedRisk = true
     logDebug "updated()"
 }
@@ -555,6 +570,36 @@ boolean roomIncludeValue(idx, room = null) {
     true
 }
 
+def applySortRoomIncludes() {
+    def order = state.sortRoomOrder ?: []
+    def map = (state.sortRoomInclude ?: [:]) as Map
+    order.each { roomName ->
+        def key = normalizeLabel(roomName)
+        def settingName = sortRoomSettingName(roomName)
+        def setting = settings[settingName]
+        if (setting != null) {
+            map[key] = setting != false
+        } else if (!map.containsKey(key)) {
+            map[key] = true
+        }
+    }
+    state.sortRoomInclude = map
+}
+
+boolean sortRoomIncluded(String roomName) {
+    if (!roomName) return false
+    def key = normalizeLabel(roomName)
+    def map = state.sortRoomInclude ?: [:]
+    if (map.containsKey(key)) return map[key] != false
+    def setting = settings[sortRoomSettingName(roomName)]
+    if (setting != null) return setting != false
+    true
+}
+
+String sortRoomSettingName(String roomName) {
+    "sortRoom_" + normalizeLabel(roomName).replaceAll(" ", "_")
+}
+
 def handleAddRoomButton() {
     def name = (addFromCatalog ?: addRoomName ?: "").toString().trim()
     if (!name) return
@@ -662,11 +707,13 @@ def handleSortDevices() {
         return
     }
     refreshScanIntoState()
+    applySortRoomIncludes()
     def excluded = (excludedDeviceIds ?: []).collect { it.toString() } as Set
     def queue = []
     def undo = []
     (state.matchPreview ?: []).each { row ->
         if (!row.proposedRoomKey) return
+        if (!sortRoomIncluded(row.proposedRoomName)) return
         if (excluded.contains(row.deviceId.toString())) return
         def roomId = row.proposedRoomId
         if (!roomId) {

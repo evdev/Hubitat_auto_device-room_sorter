@@ -2,9 +2,9 @@
   "packageName": "Auto Room Sorter",
   "minimumHEVersion": "2.3.0",
   "author": "Ephrayim",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "dateReleased": "2026/08/07",
-  "releaseNotes": "1.0.1 Add per-room Create checkboxes on Step 1 so detected rooms can be skipped.\n1.0.0 Initial release: detect room names in device labels, create missing rooms, sort unassigned devices with preview/exclusions/leftovers and one-level undo.",
+  "releaseNotes": "1.0.2 Add per-room Sort checkboxes on Step 2 to skip sorting into selected rooms.\n1.0.1 Add per-room Create checkboxes on Step 1 so detected rooms can be skipped.\n1.0.0 Initial release: detect room names in device labels, create missing rooms, sort unassigned devices with preview/exclusions/leftovers and one-level undo.",
   "documentationLink": "https://github.com/evdev/Hubitat_auto_device-room_sorter",
   "category": "Convenience",
   "tags": [
