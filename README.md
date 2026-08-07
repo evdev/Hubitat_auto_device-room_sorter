@@ -38,7 +38,7 @@ Already-assigned devices are **never** moved.
 - Normalization: lowercase, strip apostrophes (`Saadya's` → `saadyas`), replace other non-alphanumerics with spaces (`Backyard_Left_Side` → `backyard left side`), tokenize.
 - Aliases match only as whole token sequences (no substring hits inside longer words).
 - Longest / most-specific alias wins; ties are flagged **ambiguous** in the preview.
-- Alias safety: minimum 3 characters; bare qualifiers like `master` / `guest` are rejected; generic words like `room` / `hall` are denied.
+- Alias safety: minimum 3 characters (capitalized `LR` / `DR` allowed; they match only as `LR ` / `DR ` in labels); bare qualifiers like `master` / `guest` are rejected; generic words like `room` / `hall` are denied.
 
 Child and virtual devices are included by default (toggles on the main page).
 

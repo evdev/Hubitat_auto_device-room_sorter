@@ -14,7 +14,7 @@
  *
  * Never uses /device/updateRoom (name-based; can create junk rooms).
  *
- * Version: 1.1.0
+ * Version: 1.1.2
  */
 
 definition(
@@ -123,7 +123,7 @@ Detected rooms: <b>${plan.size()}</b>"""
                 defaultValue: false, submitOnChange: true
             input "excludeVirtual", "bool", title: "Exclude virtual devices",
                 defaultValue: false, submitOnChange: true
-            input "logEnable", "bool", title: "Enable debug logging", defaultValue: false
+            input "logEnable", "bool", title: "Enable debug logging (Logs → Apps)", defaultValue: false
             input "hubSecurity", "bool", title: "Hub login security enabled", defaultValue: false, submitOnChange: true
             if (hubSecurity) {
                 input "hubUsername", "string", title: "Username", required: true
@@ -517,6 +517,8 @@ def refreshScanIntoState() {
         }
     }
     state.matchPreview = matchPreview
+    def proposed = matchPreview.findAll { it.proposedRoomKey }
+    logDebug "Scan refresh: ${rooms.size()} rooms, ${devices.size()} devices, ${plan.size()} plan rooms, ${proposed.size()} proposed matches"
 }
 
 def applyDeviceFilters(devices) {
@@ -699,7 +701,7 @@ def handleAddRoomButton() {
     def existing = hubRooms.find { normalizeLabel(it.name) == normalizeLabel(name) }
     def plan = state.roomPlan ?: []
     if (plan.find { normalizeLabel(it.canonicalName) == normalizeLabel(name) }) {
-        log.info "Room already in plan: ${name}"
+        logInfo "Room already in plan: ${name}"
         return
     }
     plan << [
@@ -733,15 +735,18 @@ def handleAddLeftovers() {
 def handleCreateRooms() {
     if (!acknowledgedRisk) {
         state.lastCreateLog = "Refused: safety acknowledgment required."
+        logWarn "Create rooms refused: safety acknowledgment required"
         return
     }
     if (!writeProbeOk()) {
         state.lastCreateLog = "Write probe failed. Aborting create."
+        logError "Create rooms aborted: write probe failed"
         return
     }
     applyRoomPageEdits()
     def lines = []
     def plan = state.roomPlan ?: []
+    logInfo "Creating rooms from plan (${plan.size()} entries)"
     plan.each { room ->
         if (room.hubRoomId) {
             lines << "SKIP (exists): ${room.canonicalName} id=${room.hubRoomId}"
@@ -757,11 +762,14 @@ def handleCreateRooms() {
             if (newId) {
                 room.hubRoomId = newId as Long
                 lines << "CREATED: ${room.canonicalName} id=${newId}"
+                logDebug "Created room ${room.canonicalName} id=${newId}"
             } else {
                 lines << "FAILED: ${room.canonicalName} — response ${resp}"
+                logError "Failed to create room ${room.canonicalName}: ${resp}"
             }
         } catch (Exception e) {
             lines << "ERROR: ${room.canonicalName} — ${e.message}"
+            logError "Error creating room ${room.canonicalName}: ${e.message}"
         }
     }
     // Refresh IDs from hub
@@ -776,20 +784,24 @@ def handleCreateRooms() {
     state.lastCreatedRoomIds = plan.findAll { r ->
         lines.any { it.startsWith("CREATED: ${r.canonicalName}") }
     }.collect { it.hubRoomId }.findAll { it }
+    logInfo "Create rooms finished: ${(state.lastCreatedRoomIds ?: []).size()} created"
     refreshScanIntoState()
 }
 
 def handleSortDevices() {
     if (!acknowledgedRisk) {
         state.lastRunLog = ["Refused: safety acknowledgment required."]
+        logWarn "Sort refused: safety acknowledgment required"
         return
     }
     if (state.applyInProgress) {
         state.lastRunLog = ["Sort already in progress."]
+        logWarn "Sort refused: already in progress"
         return
     }
     if (!writeProbeOk()) {
         state.lastRunLog = ["Write probe failed. Aborting sort."]
+        logError "Sort aborted: write probe failed"
         return
     }
     refreshScanIntoState()
@@ -824,6 +836,7 @@ def handleSortDevices() {
     state.applyInProgress = true
     state.applyStartedAt = now()
     state.applyProgress = "Queued ${queue.size()} device(s)"
+    logInfo "Sort queued ${queue.size()} device(s)"
     runIn(1, "applyNextBatch")
 }
 
@@ -831,7 +844,7 @@ def applyNextBatch() {
     if (!state.applyInProgress) return
     // Stale lock
     if (state.applyStartedAt && (now() - (state.applyStartedAt as Long)) > 5 * 60 * 1000) {
-        log.warn "Apply lock stale; clearing"
+        logWarn "Apply lock stale; clearing"
         cancelApply()
         return
     }
@@ -839,25 +852,31 @@ def applyNextBatch() {
     if (!queue) {
         state.applyInProgress = false
         state.applyProgress = "Done. ${(state.lastRunLog ?: []).size()} log line(s)."
+        logInfo "Sort finished: ${(state.lastRunLog ?: []).size()} log line(s)"
         return
     }
     def batch = queue.take(25)
     state.applyQueue = queue.drop(25)
     def logLines = state.lastRunLog ?: []
+    logDebug "Apply batch of ${batch.size()}; remaining ${state.applyQueue.size()}"
     batch.each { item ->
         if (item.skip) {
             logLines << "SKIP ${item.deviceName}: ${item.skip}"
+            logWarn "Skip ${item.deviceName}: ${item.skip}"
             return
         }
         try {
             def resp = setDeviceRoom(item.deviceId, item.roomId)
             if (resp?.success) {
                 logLines << "OK ${item.deviceName} → ${item.roomName} (${item.roomId})"
+                logDebug "OK ${item.deviceName} → ${item.roomName} (${item.roomId})"
             } else {
                 logLines << "FAIL ${item.deviceName} → ${item.roomName}: ${resp}"
+                logError "Fail ${item.deviceName} → ${item.roomName}: ${resp}"
             }
         } catch (Exception e) {
             logLines << "ERROR ${item.deviceName}: ${e.message}"
+            logError "Error assigning ${item.deviceName}: ${e.message}"
         }
         pauseExecution(50)
     }
@@ -868,6 +887,7 @@ def applyNextBatch() {
     } else {
         state.applyInProgress = false
         state.applyProgress = "Done. ${logLines.size()} device(s) processed."
+        logInfo "Sort finished: ${logLines.size()} device(s) processed"
         refreshScanIntoState()
     }
 }
@@ -880,26 +900,37 @@ def cancelApply() {
     def logLines = state.lastRunLog ?: []
     logLines << "CANCELLED by user"
     state.lastRunLog = logLines
+    logWarn "Sort cancelled"
 }
 
 def handleUndo() {
     def undo = state.lastRun?.undo
     if (!undo) {
         state.lastUndoLog = "Nothing to undo."
+        logInfo "Undo: nothing to undo"
         return
     }
     if (!writeProbeOk()) {
         state.lastUndoLog = "Write probe failed."
+        logError "Undo aborted: write probe failed"
         return
     }
     def lines = []
+    logInfo "Undo starting for ${undo.size()} device(s)"
     undo.each { entry ->
         try {
             def prior = entry.previousRoomId ?: 0
             def resp = setDeviceRoom(entry.deviceId, prior as Long)
-            lines << (resp?.success ? "RESTORED device ${entry.deviceId} → room ${prior}" : "FAIL device ${entry.deviceId}: ${resp}")
+            if (resp?.success) {
+                lines << "RESTORED device ${entry.deviceId} → room ${prior}"
+                logDebug "Restored device ${entry.deviceId} → room ${prior}"
+            } else {
+                lines << "FAIL device ${entry.deviceId}: ${resp}"
+                logError "Undo fail device ${entry.deviceId}: ${resp}"
+            }
         } catch (Exception e) {
             lines << "ERROR device ${entry.deviceId}: ${e.message}"
+            logError "Undo error device ${entry.deviceId}: ${e.message}"
         }
         pauseExecution(50)
     }
@@ -920,14 +951,17 @@ def handleUndo() {
                 try {
                     deleteRoom(rid)
                     lines << "DELETED empty room ${still.name} (${rid})"
+                    logDebug "Deleted empty room ${still.name} (${rid})"
                 } catch (Exception e) {
                     lines << "ERROR delete room ${rid}: ${e.message}"
+                    logError "Error deleting room ${rid}: ${e.message}"
                 }
             }
         }
     }
     state.lastUndoLog = lines.join("\n")
     state.lastRun = null
+    logInfo "Undo finished: ${lines.size()} log line(s)"
     refreshScanIntoState()
 }
 
@@ -972,6 +1006,22 @@ Map matchLabelAgainstTargets(String label, List targets) {
     def candidates = []
     targets.each { t ->
         (t.aliases ?: []).each { alias ->
+            def aliasTrim = alias == null ? "" : alias.toString().trim()
+            if (isAllowedShortAlias(aliasTrim)) {
+                def idx = indexOfCapitalizedAbbrev(label, aliasTrim)
+                if (idx < 0) return
+                candidates << [
+                    key: t.key ?: t.canonicalName,
+                    canonicalName: t.canonicalName,
+                    aliases: t.aliases,
+                    hubRoomId: t.hubRoomId,
+                    matchedAlias: aliasTrim,
+                    scoreTokens: 1,
+                    scoreChars: aliasTrim.size(),
+                    position: idx
+                ]
+                return
+            }
             def aliasTokens = tokenizeLabel(alias)
             if (!aliasTokens) return
             def idx = indexOfTokenSequence(tokens, aliasTokens)
@@ -1017,13 +1067,30 @@ int indexOfTokenSequence(List tokens, List aliasTokens) {
     return -1
 }
 
+/** Match uppercase abbrev as its own token followed by whitespace (e.g. "LR Light"). */
+int indexOfCapitalizedAbbrev(String label, String abbrev) {
+    if (!label || !abbrev) return -1
+    def re = ~/(?:^|[^A-Za-z0-9])(${java.util.regex.Pattern.quote(abbrev)})\s/
+    def m = (label =~ re)
+    if (!m.find()) return -1
+    def prefix = label.substring(0, m.start(1))
+    return tokenizeLabel(prefix).size()
+}
+
 List validateAliasList(String aliasStr) {
     def warnings = []
     splitAliases(aliasStr).each { alias ->
-        def n = normalizeLabel(alias)
+        def trimmed = alias.trim()
+        if (!trimmed) return
+        if (isAllowedShortAlias(trimmed)) return
+        def n = normalizeLabel(trimmed)
         if (!n) return
         if (n.replace(" ", "").size() < 3) {
-            warnings << "'${alias}' is shorter than 3 characters"
+            if (n in ["lr", "dr"]) {
+                warnings << "'${alias}' must be capitalized as ${n.toUpperCase()} (matches only as '${n.toUpperCase()} ' in labels)"
+            } else {
+                warnings << "'${alias}' is shorter than 3 characters"
+            }
         }
         def toks = tokenizeLabel(alias)
         if (toks.size() == 1 && isBareQualifier(toks[0])) {
@@ -1034,6 +1101,10 @@ List validateAliasList(String aliasStr) {
         }
     }
     warnings
+}
+
+boolean isAllowedShortAlias(String alias) {
+    alias in ["LR", "DR"]
 }
 
 List findAliasCollisions(List plan) {
@@ -1073,20 +1144,29 @@ Map probeHubEndpoints() {
     try {
         def rooms = hubGetJson("/room/listRoomsJson")
         if (!(rooms instanceof List)) {
-            return [ok: false, message: "/room/listRoomsJson did not return a list"]
+            def msg = "/room/listRoomsJson did not return a list"
+            logError "Probe failed: ${msg}"
+            return [ok: false, message: msg]
         }
         def devicesPayload = hubGetJson("/hub2/devicesList")
         if (!(devicesPayload instanceof Map) || devicesPayload.devices == null) {
             // fallback probe
             def alt = hubGetJson("/device/list/data")
             if (!(alt instanceof List)) {
-                return [ok: false, message: "Neither /hub2/devicesList nor /device/list/data responded as expected"]
+                def msg = "Neither /hub2/devicesList nor /device/list/data responded as expected"
+                logError "Probe failed: ${msg}"
+                return [ok: false, message: msg]
             }
-            return [ok: true, message: "Rooms ${rooms.size()}, devices(list/data) ${alt.size()} (hub2 unavailable — children missing)"]
+            def msg = "Rooms ${rooms.size()}, devices(list/data) ${alt.size()} (hub2 unavailable — children missing)"
+            logWarn "Probe degraded: hub2/devicesList unavailable; using /device/list/data"
+            return [ok: true, message: msg]
         }
         def flat = flattenHub2Devices(devicesPayload)
-        return [ok: true, message: "Firmware probe OK — ${rooms.size()} rooms, ${flat.size()} devices (incl. children)"]
+        def msg = "Firmware probe OK — ${rooms.size()} rooms, ${flat.size()} devices (incl. children)"
+        logDebug msg
+        return [ok: true, message: msg]
     } catch (Exception e) {
+        logError "Probe failed: ${e.message}"
         return [ok: false, message: e.message]
     }
 }
@@ -1096,15 +1176,18 @@ boolean writeProbeOk() {
         def devices = fetchAllDevices()
         def candidate = devices.find { !it.roomId }
         if (!candidate) {
-            log.warn "Write probe skipped: no unassigned device available"
+            logWarn "Write probe skipped: no unassigned device available"
             return true
         }
         def resp = setDeviceRoom(candidate.id, 0L)
-        if (resp?.success) return true
-        log.error "Write probe failed: ${resp}"
+        if (resp?.success) {
+            logDebug "Write probe OK for device ${candidate.id}"
+            return true
+        }
+        logError "Write probe failed: ${resp}"
         return false
     } catch (Exception e) {
-        log.error "Write probe error: ${e.message}"
+        logError "Write probe error: ${e.message}"
         return false
     }
 }
@@ -1122,7 +1205,7 @@ List fetchAllDevices() {
             return flattenHub2Devices(payload)
         }
     } catch (Exception e) {
-        log.warn "hub2/devicesList failed: ${e.message}; falling back to /device/list/data"
+        logWarn "hub2/devicesList failed: ${e.message}; falling back to /device/list/data"
     }
     def list = hubGetJson("/device/list/data")
     if (!(list instanceof List)) throw new RuntimeException("Bad devices payload")
@@ -1204,8 +1287,14 @@ String hubGetRaw(String path, Map query = null) {
     if (query) params.query = query
     if (state.cookie) params.headers.Cookie = state.cookie
     def body = null
-    httpGet(params) { resp ->
-        body = resp.data?.text ?: resp.data
+    try {
+        logDebug "GET ${path}${query ? " ${query}" : ""}"
+        httpGet(params) { resp ->
+            body = resp.data?.text ?: resp.data
+        }
+    } catch (Exception e) {
+        logError "GET ${path} failed: ${e.message}"
+        throw e
     }
     return body?.toString()
 }
@@ -1223,13 +1312,19 @@ Map hubPostJson(String path, Map bodyMap) {
     ]
     if (state.cookie) params.headers.Cookie = state.cookie
     def result = null
-    httpPost(params) { resp ->
-        def text = resp.data?.text ?: resp.data
-        if (text instanceof Map) {
-            result = text
-        } else {
-            result = new groovy.json.JsonSlurper().parseText(text.toString())
+    try {
+        logDebug "POST ${path}"
+        httpPost(params) { resp ->
+            def text = resp.data?.text ?: resp.data
+            if (text instanceof Map) {
+                result = text
+            } else {
+                result = new groovy.json.JsonSlurper().parseText(text.toString())
+            }
         }
+    } catch (Exception e) {
+        logError "POST ${path} failed: ${e.message}"
+        throw e
     }
     return result as Map
 }
@@ -1239,13 +1334,22 @@ def ensureHubCookie() {
         state.cookie = null
         return
     }
-    httpPost([
-        uri: "http://127.0.0.1:8080",
-        path: "/login",
-        query: [loginRedirect: "/"],
-        body: [username: hubUsername, password: hubPassword, submit: "Login"]
-    ]) { resp ->
-        state.cookie = resp?.headers?.'Set-Cookie'?.split(';')?.getAt(0)
+    try {
+        logDebug "POST /login (hub security)"
+        httpPost([
+            uri: "http://127.0.0.1:8080",
+            path: "/login",
+            query: [loginRedirect: "/"],
+            body: [username: hubUsername, password: hubPassword, submit: "Login"]
+        ]) { resp ->
+            state.cookie = resp?.headers?.'Set-Cookie'?.split(';')?.getAt(0)
+        }
+        if (!state.cookie) {
+            logWarn "Hub login did not return a session cookie"
+        }
+    } catch (Exception e) {
+        logError "Hub login failed: ${e.message}"
+        throw e
     }
 }
 
@@ -1269,8 +1373,20 @@ String calloutBox(String html, String kind) {
     "<div style='background:${s.bg};border:1px solid ${s.border};color:${s.color};border-radius:6px;padding:10px 12px;margin:4px 0;'>${html}</div>"
 }
 
+def logError(msg) {
+    log.error "${msg}"
+}
+
+def logWarn(msg) {
+    log.warn "${msg}"
+}
+
+def logInfo(msg) {
+    if (logEnable) log.info "${msg}"
+}
+
 def logDebug(msg) {
-    if (logEnable) log.debug msg
+    if (logEnable) log.debug "${msg}"
 }
 
 // ---------------------------------------------------------------------------
@@ -1292,12 +1408,12 @@ Map roomCatalog() {
         "Master Bathroom": ["master bathroom", "master bath", "masterbathroom", "ensuite", "en suite", "en-suite"],
         "Bathroom": ["bathroom", "bath room"],
         "Guest Bathroom": ["guest bathroom", "guest bath"],
-        "Powder Room": ["powder room", "half bath", "halfbath", "powderroom"],
+        "Powder Room": ["powder room", "powder", "half bath", "halfbath", "powderroom"],
         "Kids Bathroom": ["kids bathroom", "kids bath"],
         "Jack and Jill Bathroom": ["jack and jill", "jack & jill"],
 
         // Living / family
-        "Living Room": ["living room", "livingroom", "living rm"],
+        "Living Room": ["living room", "livingroom", "living rm", "LR"],
         "Family Room": ["family room", "familyroom"],
         "Great Room": ["great room", "greatroom"],
         "Sitting Room": ["sitting room"],
@@ -1307,8 +1423,8 @@ Map roomCatalog() {
         "Playroom": ["playroom", "play room", "game room", "gamesroom"],
 
         // Kitchen / dining
-        "Kitchen": ["kitchen"],
-        "Dining Room": ["dining room", "diningroom", "dining"],
+        "Kitchen": ["kitchen", "breakfast"],
+        "Dining Room": ["dining room", "diningroom", "dining", "DR"],
         "Breakfast Nook": ["breakfast nook", "breakfast room", "nook"],
         "Pantry": ["pantry"],
         "Butler Pantry": ["butler pantry", "butlers pantry"],

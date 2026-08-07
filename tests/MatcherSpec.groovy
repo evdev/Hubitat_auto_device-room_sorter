@@ -116,6 +116,16 @@ assertEq matchName("Deck String Lights"), "Deck", "Deck"
 assertEq matchName("Front Porch Keypad LED 1"), "Front Porch", "Front Porch"
 assertEq matchName("Garage Floodlight Camera Floodlight"), "Garage", "Garage"
 assertEq matchName("Dining Room Lights"), "Dining Room", "Dining Room existing"
+assertEq matchName("LR Light"), "Living Room", "LR → Living Room"
+assertEq matchName("DR Chandelier"), "Dining Room", "DR → Dining Room"
+assertEq matchName("lr Light"), null, "lowercase lr must not match"
+assertEq matchName("Lr Light"), null, "mixed-case Lr must not match"
+assertEq matchName("LRLight"), null, "LR without trailing space must not match"
+assertEq matchName("DRIVEWAY Lights"), "Driveway", "DRIVEWAY must not match via DR"
+assertEq matchName("Breakfast Table Lights"), "Kitchen", "breakfast → Kitchen"
+assertEq matchName("Breakfast Nook Lamp"), "Breakfast Nook", "breakfast nook beats bare breakfast"
+assertEq matchName("Powder Room Light"), "Powder Room", "Powder Room existing"
+assertEq matchName("Powder Fan"), "Powder Room", "powder → Powder Room"
 
 assertEq matchName("Master Bathroom Fan"), "Master Bathroom", "Master Bathroom beats Bedroom"
 assertEq matchName("Master Bedroom Lamp"), "Master Bedroom", "Master Bedroom"
@@ -141,10 +151,13 @@ def masterOnly = script.matchLabelAgainstTargets("Master Closet Light", targets)
 assertTrue masterOnly == null || script.normalizeLabel(masterOnly.matchedAlias) != "master",
     "must not match via bare alias 'master'"
 
-def warns = script.validateAliasList("master, lr, room, kitchen")
+def warns = script.validateAliasList("master, xy, room, kitchen")
 assertTrue warns.any { it.toLowerCase().contains("master") }, "warn bare master"
-assertTrue warns.any { it.contains("3 characters") }, "warn short lr"
+assertTrue warns.any { it.contains("3 characters") }, "warn short xy"
 assertTrue warns.any { it.toLowerCase().contains("'room'") || it.contains("room") }, "warn denied room"
+assertTrue script.validateAliasList("LR, DR").isEmpty(), "allow capitalized LR/DR"
+def shortCaseWarns = script.validateAliasList("lr, dr")
+assertTrue shortCaseWarns.any { it.contains("capitalized") }, "warn lowercase lr/dr must be capitalized"
 
 println ""
 println "=== Match report (unassigned devices) ==="
