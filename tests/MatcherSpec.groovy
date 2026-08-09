@@ -159,6 +159,27 @@ assertTrue script.validateAliasList("LR, DR").isEmpty(), "allow capitalized LR/D
 def shortCaseWarns = script.validateAliasList("lr, dr")
 assertTrue shortCaseWarns.any { it.contains("capitalized") }, "warn lowercase lr/dr must be capitalized"
 
+// Parent-room inheritance
+script.settings.inheritParentRoom = true
+def planForInherit = seeded.collect { it + [key: it.canonicalName] }
+def roomsForInherit = rooms.collect { [id: it.id, name: it.name] }
+def devicesById = devices.collectEntries { [(it.id.toString()): it] }
+def kitchenEcho = devices.find { it.name == "Kitchen Echo" }
+assertTrue kitchenEcho != null && kitchenEcho.parentId != null, "fixture has Kitchen Echo child"
+def inherited = script.inheritRoomFromParent(kitchenEcho, devicesById, planForInherit, roomsForInherit)
+assertEq inherited?.canonicalName, "Kitchen", "Kitchen Echo inherits Kitchen from parent"
+assertEq inherited?.matchedAlias, "(inherited)", "inherited alias marker"
+assertEq inherited?.hubRoomId, 9 as Long, "inherited Kitchen room id"
+
+script.settings.inheritParentRoom = false
+assertEq script.inheritRoomFromParent(kitchenEcho, devicesById, planForInherit, roomsForInherit), null,
+    "inheritance disabled when toggle off"
+script.settings.inheritParentRoom = true
+
+def orphan = [id: 99999, name: "Orphan Child", parentId: 1, roomId: null]
+assertEq script.inheritRoomFromParent(orphan, devicesById, planForInherit, roomsForInherit), null,
+    "no inherit when parent has no room"
+
 println ""
 println "=== Match report (unassigned devices) ==="
 def unassigned = devices.findAll { !it.roomId }

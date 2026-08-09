@@ -8,13 +8,13 @@
  * Uses hub-local internal endpoints (verified on firmware 2.5.1.x):
  *   GET  /room/listRoomsJson
  *   GET  /hub2/devicesList
- *   POST /room/save  (JSON)
+ *   POST /room/save  (JSON; create room, or replace room membership with full deviceIds list)
  *   GET  /device/setRoom?deviceId=&roomId=
  *   GET  /room/delete/{id}
  *
  * Never uses /device/updateRoom (name-based; can create junk rooms).
  *
- * Version: 1.1.2
+ * Version: 1.2.0
  */
 
 definition(
@@ -123,6 +123,9 @@ Detected rooms: <b>${plan.size()}</b>"""
                 defaultValue: false, submitOnChange: true
             input "excludeVirtual", "bool", title: "Exclude virtual devices",
                 defaultValue: false, submitOnChange: true
+            input "inheritParentRoom", "bool",
+                title: "Propose parent's room for unmatched child devices",
+                defaultValue: true, submitOnChange: true
             input "logEnable", "bool", title: "Enable debug logging (Logs → Apps)", defaultValue: false
             input "hubSecurity", "bool", title: "Hub login security enabled", defaultValue: false, submitOnChange: true
             if (hubSecurity) {
@@ -255,6 +258,7 @@ def previewPage() {
         sortRoomIncluded(row.proposedRoomName)
     }.collectEntries { row ->
         def suffix = row.ambiguous ? " (ambiguous)" : ""
+        if (row.matchedAlias == "(inherited)") suffix += " (inherited)"
         [(row.deviceId.toString()): "${row.deviceName} → ${row.proposedRoomName}${suffix}"]
     }
     def includedRooms = roomOrder.findAll { sortRoomIncluded(it) }
@@ -273,6 +277,7 @@ def previewPage() {
             paragraph """${badge("will sort", "#2e7d32")} Room checked and devices included<br>
 ${badge("skipped", "#757575")} Room unchecked — nothing sorted into it<br>
 ⚠ <b>ambiguous</b> — two rooms tied for best match; review before sorting<br>
+<span style='color:#888;'>(inherited)</span> — unmatched child proposed from parent's room<br>
 <span style='color:#888;'>(room not created)</span> — run Step 1 → Create Rooms first"""
             if (missingRoomCount) {
                 def names = matches.findAll { !it.proposedRoomId && it.proposedRoomKey }
@@ -302,6 +307,7 @@ ${badge("skipped", "#757575")} Room unchecked — nothing sorted into it<br>
                         submitOnChange: true
                     def lines = devices.collect { d ->
                         def flag = d.ambiguous ? " ⚠ ambiguous" : ""
+                        if (d.matchedAlias == "(inherited)") flag += " <span style='color:#888;'>(inherited)</span>"
                         def missing = !d.proposedRoomId ? " <span style='color:#888;'>(room not created)</span>" : ""
                         "• ${escapeHtml(d.deviceName)}${flag}${missing}"
                     }.join("<br>")
@@ -466,9 +472,8 @@ def installed() {
 def refreshScanIntoState() {
     applyRoomPageEdits()
     def rooms = fetchHubRooms()
-    def devices = fetchAllDevices()
-    devices = applyDeviceFilters(devices)
-    state.hubRooms = rooms
+    def allDevices = fetchAllDevices()
+    def devices = applyDeviceFilters(allDevices)
     state.deviceSnapshot = devices.collect { [
         id: it.id,
         name: it.name,
@@ -478,6 +483,11 @@ def refreshScanIntoState() {
         depth: it.depth,
         parentId: it.parentId
     ] }
+    // Keep unfiltered parent lookup map for inheritance (parents may themselves be filtered)
+    def devicesById = [:]
+    allDevices.each { d -> devicesById[d.id?.toString()] = d }
+
+    state.hubRooms = rooms
 
     def seeded = buildSeededRoomTargets(rooms)
     def plan = mergePlanWithDetections(devices, seeded, rooms)
@@ -492,6 +502,9 @@ def refreshScanIntoState() {
             if (planRoom && planRoom.include == false && !planRoom.hubRoomId) {
                 result = null
             }
+        }
+        if (!result) {
+            result = inheritRoomFromParent(device, devicesById, plan, rooms)
         }
         matchPreview << [
             deviceId: device.id,
@@ -519,6 +532,30 @@ def refreshScanIntoState() {
     state.matchPreview = matchPreview
     def proposed = matchPreview.findAll { it.proposedRoomKey }
     logDebug "Scan refresh: ${rooms.size()} rooms, ${devices.size()} devices, ${plan.size()} plan rooms, ${proposed.size()} proposed matches"
+}
+
+Map inheritRoomFromParent(device, Map devicesById, List plan, List rooms) {
+    if (inheritParentRoom == false) return null
+    def parentId = device?.parentId
+    if (!parentId) return null
+    def parent = devicesById[parentId.toString()]
+    if (!parent?.roomId) return null
+    def roomName = (parent.roomName ?: "").toString().trim()
+    def planRoom = plan.find { it.hubRoomId?.toString() == parent.roomId.toString() }
+    if (!planRoom && roomName) {
+        planRoom = plan.find { normalizeLabel(it.canonicalName) == normalizeLabel(roomName) }
+    }
+    if (!roomName) {
+        roomName = planRoom?.canonicalName ?: (rooms.find { it.id?.toString() == parent.roomId.toString() }?.name ?: "")
+    }
+    if (!roomName) return null
+    [
+        key: planRoom?.key ?: roomName,
+        canonicalName: planRoom?.canonicalName ?: roomName,
+        hubRoomId: (planRoom?.hubRoomId ?: parent.roomId) as Long,
+        matchedAlias: "(inherited)",
+        ambiguous: false
+    ]
 }
 
 def applyDeviceFilters(devices) {
@@ -848,38 +885,72 @@ def applyNextBatch() {
         cancelApply()
         return
     }
-    def queue = state.applyQueue ?: []
+    def queue = (state.applyQueue ?: []) as List
     if (!queue) {
         state.applyInProgress = false
         state.applyProgress = "Done. ${(state.lastRunLog ?: []).size()} log line(s)."
         logInfo "Sort finished: ${(state.lastRunLog ?: []).size()} log line(s)"
         return
     }
-    def batch = queue.take(25)
-    state.applyQueue = queue.drop(25)
     def logLines = state.lastRunLog ?: []
-    logDebug "Apply batch of ${batch.size()}; remaining ${state.applyQueue.size()}"
-    batch.each { item ->
-        if (item.skip) {
-            logLines << "SKIP ${item.deviceName}: ${item.skip}"
-            logWarn "Skip ${item.deviceName}: ${item.skip}"
-            return
-        }
-        try {
-            def resp = setDeviceRoom(item.deviceId, item.roomId)
-            if (resp?.success) {
-                logLines << "OK ${item.deviceName} → ${item.roomName} (${item.roomId})"
-                logDebug "OK ${item.deviceName} → ${item.roomName} (${item.roomId})"
-            } else {
-                logLines << "FAIL ${item.deviceName} → ${item.roomName}: ${resp}"
-                logError "Fail ${item.deviceName} → ${item.roomName}: ${resp}"
-            }
-        } catch (Exception e) {
-            logLines << "ERROR ${item.deviceName}: ${e.message}"
-            logError "Error assigning ${item.deviceName}: ${e.message}"
-        }
-        pauseExecution(50)
+
+    // Drain skip entries first
+    while (queue && queue[0]?.skip) {
+        def item = queue.remove(0)
+        logLines << "SKIP ${item.deviceName}: ${item.skip}"
+        logWarn "Skip ${item.deviceName}: ${item.skip}"
     }
+    if (!queue) {
+        state.applyQueue = []
+        state.lastRunLog = logLines
+        state.applyInProgress = false
+        state.applyProgress = "Done. ${logLines.size()} device(s) processed."
+        logInfo "Sort finished: ${logLines.size()} device(s) processed"
+        refreshScanIntoState()
+        return
+    }
+
+    // Process one room per tick via bulk membership replace (merged with existing devices)
+    def roomId = queue[0].roomId as Long
+    def roomName = queue[0].roomName
+    def batch = []
+    def remaining = []
+    queue.each { item ->
+        if (!item.skip && item.roomId != null && (item.roomId as Long) == roomId) {
+            batch << item
+        } else {
+            remaining << item
+        }
+    }
+    state.applyQueue = remaining
+    logDebug "Apply room ${roomName} (${roomId}): ${batch.size()} device(s); remaining ${remaining.size()}"
+
+    def assigned = bulkAssignDevicesToRoom(roomId, roomName, batch)
+    if (assigned) {
+        batch.each { item ->
+            logLines << "OK ${item.deviceName} → ${roomName} (${roomId})"
+            logDebug "OK ${item.deviceName} → ${roomName} (${roomId})"
+        }
+    } else {
+        logWarn "Bulk assign failed for ${roomName}; falling back to per-device setRoom"
+        batch.each { item ->
+            try {
+                def resp = setDeviceRoom(item.deviceId, item.roomId)
+                if (resp?.success) {
+                    logLines << "OK ${item.deviceName} → ${item.roomName} (${item.roomId})"
+                    logDebug "OK ${item.deviceName} → ${item.roomName} (${item.roomId})"
+                } else {
+                    logLines << "FAIL ${item.deviceName} → ${item.roomName}: ${resp}"
+                    logError "Fail ${item.deviceName} → ${item.roomName}: ${resp}"
+                }
+            } catch (Exception e) {
+                logLines << "ERROR ${item.deviceName}: ${e.message}"
+                logError "Error assigning ${item.deviceName}: ${e.message}"
+            }
+            pauseExecution(50)
+        }
+    }
+
     state.lastRunLog = logLines
     state.applyProgress = "Processed ${logLines.size()} / approx remaining ${state.applyQueue.size()}"
     if (state.applyQueue) {
@@ -1255,6 +1326,81 @@ List flattenHub2Devices(Map payload) {
 
 Map createRoom(String name) {
     hubPostJson("/room/save", [roomId: 0, name: name, deviceIds: []])
+}
+
+/**
+ * Bulk-assign devices into a room via POST /room/save.
+ * Hub replaces the room's full membership with deviceIds, so existing members must be merged in.
+ * Returns true on success.
+ */
+boolean bulkAssignDevicesToRoom(Long roomId, String roomName, List batch) {
+    if (!roomId || !batch) return false
+    def newIds = batch.collect { it.deviceId as Long }
+    try {
+        def existing = currentRoomDeviceIds(roomId)
+        def merged = [] as LinkedHashSet
+        existing.each { merged << (it as Long) }
+        newIds.each { merged << (it as Long) }
+        def resp = updateRoomMembership(roomId, roomName, merged as List)
+        if (resp == null) return false
+        if (resp instanceof Map) {
+            // create/update returns {roomId: N} on success; errors often include error key
+            if (resp.error) {
+                logError "Bulk assign ${roomName}: ${resp}"
+                return false
+            }
+            def returned = resp.roomId
+            if (returned != null && returned.toString() != roomId.toString() && returned.toString() != "0") {
+                // unexpected id change — treat as failure
+                logError "Bulk assign ${roomName}: unexpected roomId ${returned}"
+                return false
+            }
+        }
+        return true
+    } catch (Exception e) {
+        logError "Bulk assign ${roomName} failed: ${e.message}"
+        return false
+    }
+}
+
+Map updateRoomMembership(Long roomId, String roomName, List deviceIds) {
+    hubPostJson("/room/save", [
+        roomId: roomId as Long,
+        name: roomName,
+        deviceIds: deviceIds.collect { it as Long }
+    ])
+}
+
+List currentRoomDeviceIds(Long roomId) {
+    // Prefer platform API when available (includes deviceIds)
+    try {
+        def rooms = app.getRooms()
+        if (rooms instanceof List) {
+            def hit = rooms.find { it?.id?.toString() == roomId.toString() }
+            if (hit?.deviceIds != null) {
+                return (hit.deviceIds as List).collect { it as Long }
+            }
+        }
+    } catch (Exception ignored) {
+        // fall through
+    }
+    // Snapshot of devices currently in this room
+    def fromSnapshot = (state.deviceSnapshot ?: []).findAll {
+        it.roomId != null && it.roomId.toString() == roomId.toString()
+    }.collect { it.id as Long }
+    if (fromSnapshot) return fromSnapshot
+    // Hub2 rooms tree
+    try {
+        def payload = hubGetJson("/hub2/roomsList")
+        def nodes = payload?.roomNodes ?: []
+        def node = nodes.find { it?.data?.id?.toString() == roomId.toString() }
+        if (node) {
+            return (node.children ?: []).collect { it?.data?.id as Long }.findAll { it != null }
+        }
+    } catch (Exception e) {
+        logWarn "Could not load room membership for ${roomId}: ${e.message}"
+    }
+    return []
 }
 
 Map setDeviceRoom(deviceId, Long roomId) {
