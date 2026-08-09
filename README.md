@@ -27,7 +27,7 @@ Prefer a hub backup before large sorts.
 1. **Scan** — Reads all devices (including children) from `/hub2/devicesList` and all rooms from `/room/listRoomsJson`.
 2. **Seed** — Every existing hub room becomes a match target (so `Saadya's Room Light` matches `Saadya's Room` with no setup). Matching catalog aliases are merged in (so `Outdoor …` matches your existing `Outside` room).
 3. **Step 1** — Review detected rooms. **Exists** rooms are reused (never duplicated, never renamed). **New** rooms can be created. Edit aliases freely; new room names are editable.
-4. **Step 2** — Preview matches grouped by room, exclude any devices, optionally assign leftovers manually, then **Sort Devices**. Unmatched children may show as `(inherited)` from their parent’s room.
+4. **Step 2** — Preview matches grouped by suggested room. Each group has a **Target room** dropdown that defaults to the suggestion (or **(Room not created yet - will skip)** if the room is missing). Override the target, exclude devices, optionally assign leftovers manually, then **Sort Devices**. Unmatched children may show as `(inherited)` from their parent’s room.
 5. **Undo** — One-level undo restores each device’s previous room from the last sort (and can delete empty rooms created in that run).
 
 Already-assigned devices are **never** moved.

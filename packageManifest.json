@@ -2,9 +2,9 @@
   "packageName": "Auto Room Sorter",
   "minimumHEVersion": "2.3.0",
   "author": "Ephrayim",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "dateReleased": "2026/08/09",
-  "releaseNotes": "1.2.0 Propose parent's room for unmatched child devices (toggle); sort via bulk POST /room/save per room (merges existing members) with setRoom fallback.\n1.1.2 Recognize LR→Living Room, DR→Dining Room (capitalized + trailing space only), breakfast→Kitchen; strengthen Powder Room aliases.\n1.1.1 Always log errors/warnings to hub Logs; debug toggle adds verbose progress.\n1.1.0 Friendlier, clearer app pages: status legends, grouped room lists, consistent color-coded callouts, tightened copy.\n1.0.2 Add per-room Sort checkboxes on Step 2 to skip sorting into selected rooms.\n1.0.1 Add per-room Create checkboxes on Step 1 so detected rooms can be skipped.\n1.0.0 Initial release: detect room names in device labels, create missing rooms, sort unassigned devices with preview/exclusions/leftovers and one-level undo.",
+  "releaseNotes": "1.3.0 Step 2 per-room Target room dropdown (defaults to suggestion, or skip when room not created); red messaging for missing rooms.\n1.2.0 Propose parent's room for unmatched child devices (toggle); sort via bulk POST /room/save per room (merges existing members) with setRoom fallback.\n1.1.2 Recognize LR→Living Room, DR→Dining Room (capitalized + trailing space only), breakfast→Kitchen; strengthen Powder Room aliases.\n1.1.1 Always log errors/warnings to hub Logs; debug toggle adds verbose progress.\n1.1.0 Friendlier, clearer app pages: status legends, grouped room lists, consistent color-coded callouts, tightened copy.\n1.0.2 Add per-room Sort checkboxes on Step 2 to skip sorting into selected rooms.\n1.0.1 Add per-room Create checkboxes on Step 1 so detected rooms can be skipped.\n1.0.0 Initial release: detect room names in device labels, create missing rooms, sort unassigned devices with preview/exclusions/leftovers and one-level undo.",
   "documentationLink": "https://github.com/evdev/Hubitat_auto_device-room_sorter",
   "category": "Convenience",
   "tags": [

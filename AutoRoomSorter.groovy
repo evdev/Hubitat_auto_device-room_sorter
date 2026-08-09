@@ -14,7 +14,7 @@
  *
  * Never uses /device/updateRoom (name-based; can create junk rooms).
  *
- * Version: 1.2.0
+ * Version: 1.3.0
  */
 
 definition(
@@ -253,20 +253,32 @@ def previewPage() {
     def roomOrder = byRoom.keySet().sort { it?.toLowerCase() }
     state.sortRoomOrder = roomOrder
     applySortRoomIncludes()
+    applySortRoomTargets()
+    def roomOpts = sortTargetRoomOptions()
     def excluded = (excludedDeviceIds ?: []).collect { it.toString() } as Set
     def excludeOptions = matches.findAll { row ->
         sortRoomIncluded(row.proposedRoomName)
     }.collectEntries { row ->
+        def resolved = resolveSortTarget(row.proposedRoomName)
+        def targetLabel = resolved?.roomName ?: "(will skip)"
         def suffix = row.ambiguous ? " (ambiguous)" : ""
         if (row.matchedAlias == "(inherited)") suffix += " (inherited)"
-        [(row.deviceId.toString()): "${row.deviceName} → ${row.proposedRoomName}${suffix}"]
+        [(row.deviceId.toString()): "${row.deviceName} → ${targetLabel}${suffix}"]
     }
-    def includedRooms = roomOrder.findAll { sortRoomIncluded(it) }
+    def includedRooms = roomOrder.findAll {
+        sortRoomIncluded(it) && resolveSortTarget(it)
+    }.collect { resolveSortTarget(it).roomName }.unique()
     def willSortCount = matches.count { row ->
-        sortRoomIncluded(row.proposedRoomName) && !excluded.contains(row.deviceId.toString()) && row.proposedRoomId
+        sortRoomIncluded(row.proposedRoomName) &&
+            !excluded.contains(row.deviceId.toString()) &&
+            resolveSortTarget(row.proposedRoomName)
     }
     def ambiguousCount = matches.count { it.ambiguous }
-    def missingRoomCount = matches.count { !it.proposedRoomId && it.proposedRoomKey }
+    def missingRoomGroups = roomOrder.findAll { roomName ->
+        !suggestedRoomIdForGroup(roomName, byRoom[roomName]) &&
+            effectiveSortTarget(roomName) == sortTargetSkipValue()
+    }
+    def missingRoomCount = missingRoomGroups.size()
 
     dynamicPage(name: "previewPage", title: "Step 2 — Preview & sort", nextPage: "mainPage") {
         section("Overview") {
@@ -274,16 +286,15 @@ def previewPage() {
                 "<b>${matches.size()}</b> matched device(s) across <b>${byRoom.size()}</b> room(s) · <b>${excluded.size()}</b> excluded · <b>${willSortCount}</b> ready to sort",
                 "info"
             )
-            paragraph """${badge("will sort", "#2e7d32")} Room checked and devices included<br>
+            paragraph """${badge("will sort", "#2e7d32")} Room checked, target room selected, devices included<br>
 ${badge("skipped", "#757575")} Room unchecked — nothing sorted into it<br>
+${badge("will skip", "#c62828")} Target is “room not created yet” — create in Step 1 or pick another room<br>
 ⚠ <b>ambiguous</b> — two rooms tied for best match; review before sorting<br>
 <span style='color:#888;'>(inherited)</span> — unmatched child proposed from parent's room<br>
-<span style='color:#888;'>(room not created)</span> — run Step 1 → Create Rooms first"""
+<span style='color:#c62828;'>(room not created — create in Step 1)</span>"""
             if (missingRoomCount) {
-                def names = matches.findAll { !it.proposedRoomId && it.proposedRoomKey }
-                    .collect { it.proposedRoomName }.unique().join(", ")
                 paragraph calloutBox(
-                    "These rooms are not on the hub yet — run <b>Step 1 → Create Rooms</b> before sorting into them: <b>${escapeHtml(names)}</b>",
+                    "<span style='color:#c62828;'><b>These rooms are not on the hub yet</b> — run <b>Step 1 → Create Rooms</b> before sorting into them (or pick another target room): <b>${escapeHtml(missingRoomGroups.join(", "))}</b></span>",
                     "warning"
                 )
             }
@@ -296,22 +307,49 @@ ${badge("skipped", "#757575")} Room unchecked — nothing sorted into it<br>
             if (!byRoom) {
                 paragraph calloutBox("No automatic matches among unassigned devices. Use Leftovers to assign manually, or adjust aliases in Step 1.", "info")
             } else {
-                paragraph "Uncheck a room to skip sorting any devices into it. You can still exclude individual devices below."
+                paragraph "Uncheck a room to skip it, or change <b>Target room</b> to override the auto suggestion. You can still exclude individual devices below."
                 roomOrder.each { roomName ->
                     def devices = byRoom[roomName]
                     def included = sortRoomIncluded(roomName)
-                    def statusBadge = included ? badge("will sort", "#2e7d32") : badge("skipped", "#757575")
+                    def suggestedId = suggestedRoomIdForGroup(roomName, devices)
+                    def defaultTarget = defaultSortTarget(roomName, devices)
+                    def resolved = resolveSortTarget(roomName)
+                    def effective = effectiveSortTarget(roomName)
+                    def statusBadge
+                    if (!included) {
+                        statusBadge = badge("skipped", "#757575")
+                    } else if (!resolved) {
+                        statusBadge = badge("will skip", "#c62828")
+                    } else {
+                        statusBadge = badge("will sort", "#2e7d32")
+                    }
                     input sortRoomSettingName(roomName), "bool",
-                        title: "Sort devices into ${roomName}",
+                        title: "Sort devices matched as ${roomName}",
                         defaultValue: true,
                         submitOnChange: true
+                    input sortTargetSettingName(roomName), "enum",
+                        title: "Target room",
+                        options: roomOpts,
+                        defaultValue: defaultTarget,
+                        required: false,
+                        submitOnChange: true
+                    def notes = []
+                    if (suggestedId && resolved && resolved.roomId.toString() != suggestedId.toString()) {
+                        notes << "Suggested: <b>${escapeHtml(roomName)}</b> → sorting into <b>${escapeHtml(resolved.roomName)}</b>"
+                    } else if (!suggestedId && effective == sortTargetSkipValue()) {
+                        notes << "<span style='color:#c62828;'><b>Room not created yet</b> — create in Step 1, or pick another target room</span>"
+                    } else if (!suggestedId && resolved) {
+                        notes << "Suggested room not on hub; sorting into <b>${escapeHtml(resolved.roomName)}</b>"
+                    }
                     def lines = devices.collect { d ->
                         def flag = d.ambiguous ? " ⚠ ambiguous" : ""
                         if (d.matchedAlias == "(inherited)") flag += " <span style='color:#888;'>(inherited)</span>"
-                        def missing = !d.proposedRoomId ? " <span style='color:#888;'>(room not created)</span>" : ""
+                        def missing = !d.proposedRoomId ?
+                            " <span style='color:#c62828;'>(room not created — create in Step 1)</span>" : ""
                         "• ${escapeHtml(d.deviceName)}${flag}${missing}"
                     }.join("<br>")
-                    paragraph "${statusBadge} ${devices.size()} device(s)<br>${lines}"
+                    def noteHtml = notes ? "<br>${notes.join('<br>')}" : ""
+                    paragraph "${statusBadge} ${devices.size()} device(s)${noteHtml}<br>${lines}"
                 }
             }
         }
@@ -457,6 +495,7 @@ def appButtonHandler(btn) {
 def updated() {
     applyRoomPageEdits()
     applySortRoomIncludes()
+    applySortRoomTargets()
     if (acknowledgedRisk) state.acknowledgedRisk = true
     logDebug "updated()"
 }
@@ -725,6 +764,85 @@ String sortRoomSettingName(String roomName) {
     "sortRoom_" + normalizeLabel(roomName).replaceAll(" ", "_")
 }
 
+String sortTargetSettingName(String roomName) {
+    "sortTarget_" + normalizeLabel(roomName).replaceAll(" ", "_")
+}
+
+/** Sentinel value for Stage 2 target dropdown when suggested room is not on the hub yet. */
+String sortTargetSkipValue() { "__skip__" }
+
+List availableSortRooms() {
+    def rooms = (state.hubRooms ?: []) + (state.roomPlan ?: []).findAll { it.hubRoomId }.collect {
+        [id: it.hubRoomId, name: it.canonicalName]
+    }
+    rooms.unique { it.id }.sort { it.name?.toLowerCase() }
+}
+
+Map sortTargetRoomOptions() {
+    def opts = [(sortTargetSkipValue()): "(Room not created yet - will skip)"]
+    availableSortRooms().each { room ->
+        opts[room.id.toString()] = room.name
+    }
+    opts
+}
+
+String suggestedRoomIdForGroup(String roomName, List devices = null) {
+    def rows = devices
+    if (rows == null) {
+        rows = (state.matchPreview ?: []).findAll {
+            it.proposedRoomKey && normalizeLabel(it.proposedRoomName) == normalizeLabel(roomName)
+        }
+    }
+    def withId = rows?.find { it.proposedRoomId }
+    if (withId?.proposedRoomId) return withId.proposedRoomId.toString()
+    def planRoom = (state.roomPlan ?: []).find {
+        normalizeLabel(it.canonicalName) == normalizeLabel(roomName)
+    }
+    planRoom?.hubRoomId?.toString()
+}
+
+String defaultSortTarget(String roomName, List devices = null) {
+    suggestedRoomIdForGroup(roomName, devices) ?: sortTargetSkipValue()
+}
+
+def applySortRoomTargets() {
+    def order = state.sortRoomOrder ?: []
+    def map = (state.sortRoomTarget ?: [:]) as Map
+    def matches = (state.matchPreview ?: []).findAll { it.proposedRoomKey }
+    def byRoom = matches.groupBy { it.proposedRoomName }
+    order.each { roomName ->
+        def key = normalizeLabel(roomName)
+        def setting = settings[sortTargetSettingName(roomName)]
+        if (setting != null) {
+            map[key] = setting.toString()
+        } else {
+            map[key] = defaultSortTarget(roomName, byRoom[roomName] ?: [])
+        }
+    }
+    state.sortRoomTarget = map
+}
+
+String effectiveSortTarget(String roomName) {
+    if (!roomName) return sortTargetSkipValue()
+    def key = normalizeLabel(roomName)
+    def map = state.sortRoomTarget ?: [:]
+    if (map.containsKey(key) && map[key] != null) return map[key].toString()
+    def setting = settings[sortTargetSettingName(roomName)]
+    if (setting != null) return setting.toString()
+    defaultSortTarget(roomName)
+}
+
+/** Returns [roomId, roomName] for a real target, or null when skip / missing. */
+Map resolveSortTarget(String roomName) {
+    def target = effectiveSortTarget(roomName)
+    if (!target || target == sortTargetSkipValue()) return null
+    def room = availableSortRooms().find { it.id.toString() == target.toString() }
+    if (room) return [roomId: room.id as Long, roomName: room.name]
+    def hub = (state.hubRooms ?: []).find { it.id.toString() == target.toString() }
+    if (hub) return [roomId: hub.id as Long, roomName: hub.name]
+    null
+}
+
 def handleAddRoomButton() {
     def name = (addFromCatalog ?: addRoomName ?: "").toString().trim()
     if (!name) return
@@ -842,26 +960,24 @@ def handleSortDevices() {
         return
     }
     refreshScanIntoState()
+    def matches = (state.matchPreview ?: []).findAll { it.proposedRoomKey }
+    state.sortRoomOrder = matches.groupBy { it.proposedRoomName }.keySet().sort { it?.toLowerCase() }
     applySortRoomIncludes()
+    applySortRoomTargets()
     def excluded = (excludedDeviceIds ?: []).collect { it.toString() } as Set
     def queue = []
     def undo = []
-    (state.matchPreview ?: []).each { row ->
-        if (!row.proposedRoomKey) return
+    matches.each { row ->
         if (!sortRoomIncluded(row.proposedRoomName)) return
         if (excluded.contains(row.deviceId.toString())) return
-        def roomId = row.proposedRoomId
-        if (!roomId) {
-            def planRoom = (state.roomPlan ?: []).find { normalizeLabel(it.canonicalName) == normalizeLabel(row.proposedRoomName) }
-            roomId = planRoom?.hubRoomId
-        }
-        if (!roomId) {
+        def resolved = resolveSortTarget(row.proposedRoomName)
+        if (!resolved) {
             queue << [deviceId: row.deviceId, deviceName: row.deviceName, roomId: null, roomName: row.proposedRoomName, skip: "no room id"]
             return
         }
         def prior = (state.deviceSnapshot ?: []).find { it.id == row.deviceId }
         undo << [deviceId: row.deviceId, previousRoomId: prior?.roomId ?: 0]
-        queue << [deviceId: row.deviceId, deviceName: row.deviceName, roomId: roomId as Long, roomName: row.proposedRoomName]
+        queue << [deviceId: row.deviceId, deviceName: row.deviceName, roomId: resolved.roomId as Long, roomName: resolved.roomName]
     }
     state.applyQueue = queue
     state.lastRunLog = []
