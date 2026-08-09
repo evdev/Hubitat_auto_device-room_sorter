@@ -14,7 +14,7 @@
  *
  * Never uses /device/updateRoom (name-based; can create junk rooms).
  *
- * Version: 1.3.0
+ * Version: 1.3.1
  */
 
 definition(
@@ -247,7 +247,10 @@ def previewPage() {
             section { paragraph calloutBox("Hub probe failed. Return to the main page.", "danger") }
         }
     }
-    refreshScanIntoState()
+    clearStaleApplyLock()
+    if (!state.applyInProgress) {
+        refreshScanIntoState()
+    }
     def matches = (state.matchPreview ?: []).findAll { it.proposedRoomKey }
     def byRoom = matches.groupBy { it.proposedRoomName }
     def roomOrder = byRoom.keySet().sort { it?.toLowerCase() }
@@ -279,8 +282,9 @@ def previewPage() {
             effectiveSortTarget(roomName) == sortTargetSkipValue()
     }
     def missingRoomCount = missingRoomGroups.size()
+    def refresh = state.applyInProgress ? 5 : 0
 
-    dynamicPage(name: "previewPage", title: "Step 2 — Preview & sort", nextPage: "mainPage") {
+    dynamicPage(name: "previewPage", title: "Step 2 — Preview & sort", refreshInterval: refresh, nextPage: "mainPage") {
         section("Overview") {
             paragraph calloutBox(
                 "<b>${matches.size()}</b> matched device(s) across <b>${byRoom.size()}</b> room(s) · <b>${excluded.size()}</b> excluded · <b>${willSortCount}</b> ready to sort",
@@ -326,13 +330,15 @@ ${badge("will skip", "#c62828")} Target is “room not created yet” — create
                     input sortRoomSettingName(roomName), "bool",
                         title: "Sort devices matched as ${roomName}",
                         defaultValue: true,
-                        submitOnChange: true
+                        submitOnChange: true,
+                        width: 6
                     input sortTargetSettingName(roomName), "enum",
-                        title: "Target room",
+                        title: "Target room for ${roomName}",
                         options: roomOpts,
                         defaultValue: defaultTarget,
                         required: false,
-                        submitOnChange: true
+                        submitOnChange: true,
+                        width: 6
                     def notes = []
                     if (suggestedId && resolved && resolved.roomId.toString() != suggestedId.toString()) {
                         notes << "Suggested: <b>${escapeHtml(roomName)}</b> → sorting into <b>${escapeHtml(resolved.roomName)}</b>"
@@ -349,7 +355,7 @@ ${badge("will skip", "#c62828")} Target is “room not created yet” — create
                         "• ${escapeHtml(d.deviceName)}${flag}${missing}"
                     }.join("<br>")
                     def noteHtml = notes ? "<br>${notes.join('<br>')}" : ""
-                    paragraph "${statusBadge} ${devices.size()} device(s)${noteHtml}<br>${lines}"
+                    paragraph "${statusBadge} ${devices.size()} device(s)${noteHtml}<br>${lines}", width: 12
                 }
             }
         }
@@ -367,19 +373,33 @@ ${badge("will skip", "#c62828")} Target is “room not created yet” — create
 
         section("Sort") {
             if (state.applyInProgress) {
-                paragraph calloutBox("<b>Sort in progress…</b> Open Results to watch progress or cancel.", "info")
-                href "resultsPage", title: "View progress / Cancel"
-            } else if (!acknowledgedRisk) {
-                paragraph calloutBox("Acknowledge the safety checkbox on the main page before sorting.", "danger")
-            } else {
                 paragraph calloutBox(
-                    "<b>Sort Devices</b> will assign about <b>${willSortCount}</b> device(s) into <b>${includedRooms.size()}</b> room(s). Already-assigned devices are never moved. Writes use undocumented hub endpoints.",
-                    "warning"
+                    "<b>Sort in progress…</b> ${escapeHtml(state.applyProgress ?: '')}<br>This page refreshes automatically. Open Results to watch the log or cancel.",
+                    "info"
                 )
-                input "btnSortDevices", "button", title: "Sort Devices"
+                href "resultsPage", title: "View progress / Cancel"
+            } else {
+                def progress = state.applyProgress?.toString() ?: ""
+                if (progress) {
+                    def lower = progress.toLowerCase()
+                    if (lower.contains("done") || lower.contains("cancel") || lower.contains("timed out") || lower.contains("fail")) {
+                        def kind = lower.contains("done") ? "success" :
+                            (lower.contains("cancel") || lower.contains("timed out") || lower.contains("fail") ? "warning" : "info")
+                        paragraph calloutBox("<b>${escapeHtml(progress)}</b>", kind)
+                    }
+                }
+                if (!acknowledgedRisk) {
+                    paragraph calloutBox("Acknowledge the safety checkbox on the main page before sorting.", "danger")
+                } else {
+                    paragraph calloutBox(
+                        "<b>Sort Devices</b> will assign about <b>${willSortCount}</b> device(s) into <b>${includedRooms.size()}</b> room(s). Already-assigned devices are never moved. Writes use undocumented hub endpoints.",
+                        "warning"
+                    )
+                    input "btnSortDevices", "button", title: "Sort Devices"
+                }
+                href "resultsPage", title: "Results / Undo",
+                    description: "View the last sort log or undo it"
             }
-            href "resultsPage", title: "Results / Undo",
-                description: "View the last sort log or undo it"
         }
     }
 }
@@ -423,6 +443,7 @@ def leftoversPage() {
 }
 
 def resultsPage() {
+    clearStaleApplyLock()
     def refresh = state.applyInProgress ? 5 : 0
     dynamicPage(name: "resultsPage", title: "Results", refreshInterval: refresh, nextPage: "mainPage") {
         section("Status") {
@@ -431,8 +452,9 @@ def resultsPage() {
                 input "btnCancelSort", "button", title: "Cancel sort"
             } else {
                 def progress = state.applyProgress ?: "Idle — no sort running."
-                def kind = progress.toString().toLowerCase().contains("done") ? "success" :
-                    (progress.toString().toLowerCase().contains("cancel") ? "warning" : "info")
+                def lower = progress.toString().toLowerCase()
+                def kind = lower.contains("done") ? "success" :
+                    (lower.contains("cancel") || lower.contains("timed out") || lower.contains("fail") ? "warning" : "info")
                 paragraph calloutBox(escapeHtml(progress.toString()), kind)
             }
         }
@@ -993,89 +1015,115 @@ def handleSortDevices() {
     runIn(1, "applyNextBatch")
 }
 
+def clearStaleApplyLock() {
+    if (!state.applyInProgress) return
+    if (!state.applyStartedAt) return
+    if ((now() - (state.applyStartedAt as Long)) <= 5 * 60 * 1000) return
+    logWarn "Apply lock stale on page load; clearing"
+    unschedule("applyNextBatch")
+    state.applyQueue = []
+    state.applyInProgress = false
+    state.applyProgress = "Timed out / interrupted. Check Results log."
+    def logLines = state.lastRunLog ?: []
+    logLines << "TIMED OUT / interrupted"
+    state.lastRunLog = logLines
+}
+
+def finishApply(String progressMessage) {
+    state.applyQueue = []
+    state.applyInProgress = false
+    state.applyProgress = progressMessage
+    logInfo progressMessage
+    try {
+        refreshScanIntoState()
+    } catch (Exception e) {
+        logWarn "Post-sort scan refresh failed: ${e.message}"
+    }
+}
+
 def applyNextBatch() {
     if (!state.applyInProgress) return
-    // Stale lock
-    if (state.applyStartedAt && (now() - (state.applyStartedAt as Long)) > 5 * 60 * 1000) {
-        logWarn "Apply lock stale; clearing"
-        cancelApply()
-        return
-    }
-    def queue = (state.applyQueue ?: []) as List
-    if (!queue) {
-        state.applyInProgress = false
-        state.applyProgress = "Done. ${(state.lastRunLog ?: []).size()} log line(s)."
-        logInfo "Sort finished: ${(state.lastRunLog ?: []).size()} log line(s)"
-        return
-    }
-    def logLines = state.lastRunLog ?: []
-
-    // Drain skip entries first
-    while (queue && queue[0]?.skip) {
-        def item = queue.remove(0)
-        logLines << "SKIP ${item.deviceName}: ${item.skip}"
-        logWarn "Skip ${item.deviceName}: ${item.skip}"
-    }
-    if (!queue) {
-        state.applyQueue = []
-        state.lastRunLog = logLines
-        state.applyInProgress = false
-        state.applyProgress = "Done. ${logLines.size()} device(s) processed."
-        logInfo "Sort finished: ${logLines.size()} device(s) processed"
-        refreshScanIntoState()
-        return
-    }
-
-    // Process one room per tick via bulk membership replace (merged with existing devices)
-    def roomId = queue[0].roomId as Long
-    def roomName = queue[0].roomName
-    def batch = []
-    def remaining = []
-    queue.each { item ->
-        if (!item.skip && item.roomId != null && (item.roomId as Long) == roomId) {
-            batch << item
-        } else {
-            remaining << item
+    try {
+        // Stale lock
+        if (state.applyStartedAt && (now() - (state.applyStartedAt as Long)) > 5 * 60 * 1000) {
+            logWarn "Apply lock stale; clearing"
+            cancelApply()
+            state.applyProgress = "Timed out / interrupted. Check Results log."
+            return
         }
-    }
-    state.applyQueue = remaining
-    logDebug "Apply room ${roomName} (${roomId}): ${batch.size()} device(s); remaining ${remaining.size()}"
-
-    def assigned = bulkAssignDevicesToRoom(roomId, roomName, batch)
-    if (assigned) {
-        batch.each { item ->
-            logLines << "OK ${item.deviceName} → ${roomName} (${roomId})"
-            logDebug "OK ${item.deviceName} → ${roomName} (${roomId})"
+        def queue = (state.applyQueue ?: []) as List
+        if (!queue) {
+            finishApply("Done. ${(state.lastRunLog ?: []).size()} log line(s).")
+            return
         }
-    } else {
-        logWarn "Bulk assign failed for ${roomName}; falling back to per-device setRoom"
-        batch.each { item ->
-            try {
-                def resp = setDeviceRoom(item.deviceId, item.roomId)
-                if (resp?.success) {
-                    logLines << "OK ${item.deviceName} → ${item.roomName} (${item.roomId})"
-                    logDebug "OK ${item.deviceName} → ${item.roomName} (${item.roomId})"
-                } else {
-                    logLines << "FAIL ${item.deviceName} → ${item.roomName}: ${resp}"
-                    logError "Fail ${item.deviceName} → ${item.roomName}: ${resp}"
-                }
-            } catch (Exception e) {
-                logLines << "ERROR ${item.deviceName}: ${e.message}"
-                logError "Error assigning ${item.deviceName}: ${e.message}"
+        def logLines = state.lastRunLog ?: []
+
+        // Drain skip entries first
+        while (queue && queue[0]?.skip) {
+            def item = queue.remove(0)
+            logLines << "SKIP ${item.deviceName}: ${item.skip}"
+            logWarn "Skip ${item.deviceName}: ${item.skip}"
+        }
+        if (!queue) {
+            state.lastRunLog = logLines
+            finishApply("Done. ${logLines.size()} device(s) processed.")
+            return
+        }
+
+        // Process one room per tick via bulk membership replace (merged with existing devices)
+        def roomId = queue[0].roomId as Long
+        def roomName = queue[0].roomName
+        def batch = []
+        def remaining = []
+        queue.each { item ->
+            if (!item.skip && item.roomId != null && (item.roomId as Long) == roomId) {
+                batch << item
+            } else {
+                remaining << item
             }
-            pauseExecution(50)
         }
-    }
+        state.applyQueue = remaining
+        logDebug "Apply room ${roomName} (${roomId}): ${batch.size()} device(s); remaining ${remaining.size()}"
 
-    state.lastRunLog = logLines
-    state.applyProgress = "Processed ${logLines.size()} / approx remaining ${state.applyQueue.size()}"
-    if (state.applyQueue) {
-        runIn(1, "applyNextBatch")
-    } else {
-        state.applyInProgress = false
-        state.applyProgress = "Done. ${logLines.size()} device(s) processed."
-        logInfo "Sort finished: ${logLines.size()} device(s) processed"
-        refreshScanIntoState()
+        def assigned = bulkAssignDevicesToRoom(roomId, roomName, batch)
+        if (assigned) {
+            batch.each { item ->
+                logLines << "OK ${item.deviceName} → ${roomName} (${roomId})"
+                logDebug "OK ${item.deviceName} → ${roomName} (${roomId})"
+            }
+        } else {
+            logWarn "Bulk assign failed for ${roomName}; falling back to per-device setRoom"
+            batch.each { item ->
+                try {
+                    def resp = setDeviceRoom(item.deviceId, item.roomId)
+                    if (resp?.success) {
+                        logLines << "OK ${item.deviceName} → ${item.roomName} (${item.roomId})"
+                        logDebug "OK ${item.deviceName} → ${item.roomName} (${item.roomId})"
+                    } else {
+                        logLines << "FAIL ${item.deviceName} → ${item.roomName}: ${resp}"
+                        logError "Fail ${item.deviceName} → ${item.roomName}: ${resp}"
+                    }
+                } catch (Exception e) {
+                    logLines << "ERROR ${item.deviceName}: ${e.message}"
+                    logError "Error assigning ${item.deviceName}: ${e.message}"
+                }
+                pauseExecution(50)
+            }
+        }
+
+        state.lastRunLog = logLines
+        state.applyProgress = "Processed ${logLines.size()} / approx remaining ${state.applyQueue.size()}"
+        if (state.applyQueue) {
+            runIn(1, "applyNextBatch")
+        } else {
+            finishApply("Done. ${logLines.size()} device(s) processed.")
+        }
+    } catch (Exception e) {
+        logError "Sort batch failed: ${e.message}"
+        def logLines = state.lastRunLog ?: []
+        logLines << "ERROR sort batch: ${e.message}"
+        state.lastRunLog = logLines
+        finishApply("Failed: ${e.message}. Check Results log.")
     }
 }
 
