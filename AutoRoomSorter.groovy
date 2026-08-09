@@ -294,8 +294,7 @@ def previewPage() {
 ${badge("skipped", "#757575")} Room unchecked — nothing sorted into it<br>
 ${badge("will skip", "#c62828")} Target is “room not created yet” — create in Step 1 or pick another room<br>
 ⚠ <b>ambiguous</b> — two rooms tied for best match; review before sorting<br>
-<span style='color:#888;'>(inherited)</span> — unmatched child proposed from parent's room<br>
-<span style='color:#c62828;'>(room not created — create in Step 1)</span>"""
+<span style='color:#888;'>(inherited)</span> — unmatched child proposed from parent's room"""
             if (missingRoomCount) {
                 paragraph calloutBox(
                     "<span style='color:#c62828;'><b>These rooms are not on the hub yet</b> — run <b>Step 1 → Create Rooms</b> before sorting into them (or pick another target room): <b>${escapeHtml(missingRoomGroups.join(", "))}</b></span>",
@@ -350,9 +349,7 @@ ${badge("will skip", "#c62828")} Target is “room not created yet” — create
                     def lines = devices.collect { d ->
                         def flag = d.ambiguous ? " ⚠ ambiguous" : ""
                         if (d.matchedAlias == "(inherited)") flag += " <span style='color:#888;'>(inherited)</span>"
-                        def missing = !d.proposedRoomId ?
-                            " <span style='color:#c62828;'>(room not created — create in Step 1)</span>" : ""
-                        "• ${escapeHtml(d.deviceName)}${flag}${missing}"
+                        "• ${escapeHtml(d.deviceName)}${flag}"
                     }.join("<br>")
                     def noteHtml = notes ? "<br>${notes.join('<br>')}" : ""
                     paragraph "${statusBadge} ${devices.size()} device(s)${noteHtml}<br>${lines}", width: 12
