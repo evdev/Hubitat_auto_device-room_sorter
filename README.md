@@ -5,15 +5,15 @@ Hubitat app that detects room names inside device labels, creates any missing ro
 ## Install via Hubitat Package Manager (recommended)
 
 1. Install [Hubitat Package Manager](https://hubitatpackagemanager.hubitatcommunity.com/) if you do not already have it.
-2. In HPM, choose **Install** → **From a URL** (or **Add a Custom Repository** if you prefer).
-3. Use this repository URL:
+2. In HPM, choose **Install** and search for **Auto Room Sorter**.
+3. Select **Auto Room Sorter** and install.
+4. **Apps** → **Add User App** → **Auto Room Sorter**.
+5. Optional: enter hub login security credentials in the app if your hub requires login.
+6. Check the safety acknowledgment before creating rooms or sorting.
 
-   `https://raw.githubusercontent.com/evdev/Hubitat_auto_device-room_sorter/main/repository.json`
+If it does not appear in search yet, add this custom repository URL under HPM **Settings**, then install:
 
-4. Select **Auto Room Sorter** and install.
-5. **Apps** → **Add User App** → **Auto Room Sorter**.
-6. Optional: enter hub login security credentials in the app if your hub requires login.
-7. Check the safety acknowledgment before creating rooms or sorting.
+`https://raw.githubusercontent.com/evdev/Hubitat_auto_device-room_sorter/main/repository.json`
 
 Prefer a hub backup before large sorts.
 
