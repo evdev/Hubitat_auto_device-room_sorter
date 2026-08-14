@@ -14,7 +14,7 @@
  *
  * Never uses /device/updateRoom (name-based; can create junk rooms).
  *
- * Version: 1.3.2
+ * Version: 1.3.4
  */
 
 definition(
@@ -146,6 +146,15 @@ def roomsPage() {
         state.pendingAddRoom = false
         handleAddRoomButton()
     }
+    if (state.pendingSaveAliases) {
+        state.pendingSaveAliases = false
+        handleSaveAliases()
+    }
+    if (state.pendingClearAliasKey) {
+        def suffix = state.pendingClearAliasKey
+        state.pendingClearAliasKey = null
+        handleClearAliases(suffix)
+    }
     refreshScanIntoState()
     def plan = state.roomPlan ?: []
     def existingRooms = []
@@ -169,6 +178,14 @@ ${badge("Skipped", "#757575")} New room unchecked — won't create or auto-match
             if (collisions) {
                 paragraph calloutBox("<b>Alias collisions:</b> ${escapeHtml(collisions.join('; '))}", "danger")
             }
+        }
+
+        section("Save alias edits") {
+            paragraph "Edit aliases on any room below, then tap <b>Save aliases</b>. Use <b>Clear aliases</b> on a room to wipe the pre-filled list (matching still uses the room name)."
+            if (state.lastAliasMessage) {
+                paragraph calloutBox(escapeHtml(state.lastAliasMessage.toString()), state.lastAliasOk ? "success" : "warning")
+            }
+            emitSaveAliasesButton("btnSaveAliases")
         }
 
         if (!plan) {
@@ -213,6 +230,12 @@ ${badge("Skipped", "#757575")} New room unchecked — won't create or auto-match
         }
 
         applyRoomPageEdits()
+
+        if (plan) {
+            section("Save alias edits") {
+                emitSaveAliasesButton("btnSaveAliasesBottom")
+            }
+        }
 
         section("Add another room") {
             paragraph "Enter a custom name or pick from the catalog, then tap <b>Add room to plan</b>."
@@ -491,7 +514,16 @@ def resultsPage() {
 // ---------------------------------------------------------------------------
 
 def appButtonHandler(btn) {
-    switch (btn) {
+    def name = btn?.toString()
+    if (name == "btnSaveAliases" || name == "btnSaveAliasesBottom") {
+        state.pendingSaveAliases = true
+        return
+    }
+    if (name?.startsWith("btnClearAlias_")) {
+        state.pendingClearAliasKey = name.substring("btnClearAlias_".length())
+        return
+    }
+    switch (name) {
         case "btnAddRoom":
             state.pendingAddRoom = true
             break
@@ -664,7 +696,7 @@ def mergePlanWithDetections(devices, seeded, hubRooms) {
         targets << [
             key: s.canonicalName,
             canonicalName: s.canonicalName,
-            aliases: (s.aliases ?: [s.canonicalName]) as List,
+                    aliases: aliasesFromOverride(s.canonicalName) ?: ((s.aliases ?: [s.canonicalName]) as List),
             hubRoomId: s.hubRoomId,
             fromHub: true,
             matchCount: 0
@@ -677,7 +709,7 @@ def mergePlanWithDetections(devices, seeded, hubRooms) {
         targets << [
             key: name,
             canonicalName: name,
-            aliases: ([name] + aliases) as List,
+            aliases: aliasesFromOverride(name) ?: (([name] + aliases) as List),
             hubRoomId: null,
             fromHub: false,
             matchCount: 0
@@ -698,7 +730,9 @@ def mergePlanWithDetections(devices, seeded, hubRooms) {
     byKey.values().each { entry ->
         def nkey = normalizeLabel(entry.canonicalName)
         def prev = previous[nkey]
-        if (prev?.aliases) entry.aliases = prev.aliases
+        def fromOverride = aliasesFromOverride(entry.key ?: entry.canonicalName)
+        if (fromOverride) entry.aliases = fromOverride
+        else if (prev?.aliases) entry.aliases = prev.aliases
         if (prev?.include != null) entry.include = prev.include
         if (prev?.canonicalName && !entry.hubRoomId) {
             entry.canonicalName = prev.canonicalName
@@ -720,7 +754,7 @@ def mergePlanWithDetections(devices, seeded, hubRooms) {
         plan << [
             key: prev.canonicalName,
             canonicalName: prev.canonicalName,
-            aliases: prev.aliases ?: [prev.canonicalName],
+            aliases: aliasesFromOverride(prev) ?: (prev.aliases ?: [prev.canonicalName]),
             hubRoomId: existing?.id as Long,
             fromHub: !!existing,
             matchCount: 0,
@@ -737,19 +771,119 @@ String settingKey(String prefix, idx) {
     "${prefix}_${idx}".toString()
 }
 
+String roomOverrideKey(Object roomOrName) {
+    def raw = roomOrName instanceof Map ? (roomOrName.key ?: roomOrName.canonicalName) : roomOrName
+    normalizeLabel(raw?.toString())
+}
+
+String roomAliasSettingName(Object roomOrName) {
+    "roomAlias_${aliasButtonSuffix(roomOrName)}".toString()
+}
+
+String aliasButtonSuffix(Object roomOrName) {
+    roomOverrideKey(roomOrName).replaceAll("[^a-z0-9]+", "_")
+}
+
+List aliasesFromOverride(Object roomOrName) {
+    def raw = (state.aliasOverrides ?: [:])[roomOverrideKey(roomOrName)]
+    if (raw == null) return null
+    def parsed = splitAliases(raw)
+    if (parsed) return parsed
+    def name = roomOrName instanceof Map ? (roomOrName.canonicalName ?: roomOrName.key) : roomOrName
+    name ? [name.toString()] : []
+}
+
+def putAliasOverride(Object roomOrName, String aliasStr) {
+    def overrides = new LinkedHashMap(state.aliasOverrides ?: [:])
+    overrides[roomOverrideKey(roomOrName)] = aliasStr
+    state.aliasOverrides = overrides
+}
+
+def captureAliasOverrides() {
+    def overrides = new LinkedHashMap(state.aliasOverrides ?: [:])
+    def skip = state.clearedAliasKey
+    (state.roomPlan ?: []).eachWithIndex { room, idx ->
+        def nkey = roomOverrideKey(room)
+        if (skip && nkey == skip) return
+        def aliasStr = settings[roomAliasSettingName(room)]
+        if (aliasStr == null) aliasStr = settings[settingKey("roomAliases", idx)]
+        if (aliasStr != null) {
+            overrides[nkey] = aliasStr.toString()
+        }
+    }
+    state.aliasOverrides = overrides
+    state.clearedAliasKey = null
+}
+
+def emitSaveAliasesButton(String name) {
+    input name.toString(), "button", title: "Save aliases", width: 12,
+        backgroundColor: "#2e7d32", textColor: "#ffffff"
+}
+
 def emitAliasInput(idx, room) {
-    def key = settingKey("roomAliases", idx)
+    def key = roomAliasSettingName(room)
     def current = settings[key]
+    if (current == null) current = settings[settingKey("roomAliases", idx)]
+    if (current == null) current = (state.aliasOverrides ?: [:])[roomOverrideKey(room)]
     if (current == null) current = (room.aliases ?: []).join(", ")
-    input key, "text", title: "Aliases (comma-separated)",
-        defaultValue: current.toString(), required: false, submitOnChange: true
-    def warnings = validateAliasList(current.toString())
+    current = current.toString()
+    // Never pass defaultValue: Hubitat re-applies it on Save and wipes typed aliases.
+    if (settings[key] == null) {
+        app.updateSetting(key, [type: "text", value: current])
+    }
+    input key, "text", title: "Aliases (comma-separated)", required: false
+    def clearBtn = ("btnClearAlias_" + aliasButtonSuffix(room)).toString()
+    input clearBtn, "button", title: "Clear aliases", width: 4,
+        backgroundColor: "#616161", textColor: "#ffffff"
+    def warnings = validateAliasList((settings[key] ?: current).toString())
     if (warnings) {
         paragraph calloutBox("Alias warnings: ${escapeHtml(warnings.join('; '))}", "warning")
     }
 }
 
+def handleSaveAliases() {
+    applyRoomPageEdits()
+    (state.roomPlan ?: []).each { room ->
+        def raw = (state.aliasOverrides ?: [:])[roomOverrideKey(room)]
+        if (raw == null) return
+        try {
+            app.updateSetting(roomAliasSettingName(room), [type: "text", value: raw.toString()])
+        } catch (Exception ignored) { }
+    }
+    def n = (state.roomPlan ?: []).size()
+    state.lastAliasOk = true
+    state.lastAliasMessage = "Saved aliases for ${n} room(s)."
+    logInfo "Saved aliases for ${n} room(s)"
+}
+
+def handleClearAliases(String suffix) {
+    def room = (state.roomPlan ?: []).find { aliasButtonSuffix(it) == suffix }
+    if (!room) {
+        state.lastAliasOk = false
+        state.lastAliasMessage = "Could not find that room to clear."
+        return
+    }
+    def nkey = roomOverrideKey(room)
+    state.clearedAliasKey = nkey
+    putAliasOverride(room, "")
+    try {
+        app.updateSetting(roomAliasSettingName(room), [type: "text", value: ""])
+    } catch (Exception ignored) { }
+    room.aliases = [room.canonicalName].findAll { it }
+    state.roomPlan = (state.roomPlan ?: []).collect { entry ->
+        def copy = new LinkedHashMap(entry)
+        if (copy.aliases instanceof Collection) {
+            copy.aliases = copy.aliases.collect { it }
+        }
+        copy
+    }
+    state.lastAliasOk = true
+    state.lastAliasMessage = "Cleared aliases for ${room.canonicalName}. Matching uses the room name only."
+    logInfo "Cleared aliases for ${room.canonicalName}"
+}
+
 def applyRoomPageEdits() {
+    captureAliasOverrides()
     def plan = state.roomPlan
     if (!plan) return
     plan.eachWithIndex { room, idx ->
@@ -760,10 +894,9 @@ def applyRoomPageEdits() {
         } else {
             room.include = true
         }
-        def aliasStr = settings[settingKey("roomAliases", idx)]
-        if (aliasStr != null) {
-            room.aliases = splitAliases(aliasStr)
-            if (!room.aliases) room.aliases = [room.canonicalName]
+        def fromOverride = aliasesFromOverride(room)
+        if (fromOverride) {
+            room.aliases = fromOverride
         }
     }
     // Reassign copies so Hubitat persists nested alias/name edits in state
@@ -948,6 +1081,10 @@ def handleAddRoomButton() {
     state.roomPlan = plan.sort { a, b ->
         (a.canonicalName ?: "").toLowerCase() <=> (b.canonicalName ?: "").toLowerCase()
     }
+    putAliasOverride(name, aliases.join(", "))
+    try {
+        app.updateSetting(roomAliasSettingName(name), [type: "text", value: aliases.join(", ")])
+    } catch (Exception ignored) { }
     state.lastAddRoomOk = true
     state.lastAddRoomMessage = "Added ${name} to the plan."
     clearAddRoomInputs()

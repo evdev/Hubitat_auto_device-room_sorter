@@ -206,20 +206,27 @@ def amb = script.matchLabelAgainstTargets("Shared Light", ambTargets)
 assertTrue amb?.ambiguous == true, "shared alias should be ambiguous"
 assertTrue amb?.canonicalName in ["Alpha Room", "Beta Room"], "ambiguous still picks a candidate"
 
-def aliasKey = script.settingKey("roomAliases", 0)
-assertEq aliasKey, "roomAliases_0", "settingKey format"
-assertTrue aliasKey instanceof String, "settingKey must be a plain String"
-assertTrue !(aliasKey instanceof GString), "settingKey must not be a GString"
+def kitchenRoom = [key: "Kitchen", canonicalName: "Kitchen", aliases: ["Kitchen"], hubRoomId: 9L, matchCount: 1]
+assertEq script.roomAliasSettingName(kitchenRoom), "roomAlias_kitchen", "stable alias setting name"
+assertEq script.roomOverrideKey(kitchenRoom), "kitchen", "override key is normalized name"
+assertTrue script.roomAliasSettingName(kitchenRoom) instanceof String, "alias setting name is a plain String"
+assertTrue !(script.roomAliasSettingName(kitchenRoom) instanceof GString), "alias setting name is not a GString"
+
+script.state.aliasOverrides = [:]
+script.state.roomPlan = [new LinkedHashMap(kitchenRoom)]
+script.settings.put("roomAlias_kitchen", "Kitchen, cook")
+script.applyRoomPageEdits()
+assertEq script.state.roomPlan[0].aliases, ["Kitchen", "cook"], "applyRoomPageEdits reads stable alias settings"
+assertEq script.state.aliasOverrides["kitchen"], "Kitchen, cook", "alias override stored in state"
+
+script.settings.remove("roomAlias_kitchen")
+script.state.roomPlan = [new LinkedHashMap(kitchenRoom)]
+script.applyRoomPageEdits()
+assertEq script.state.aliasOverrides["kitchen"], "Kitchen, cook", "overrides survive missing settings"
+assertEq script.state.roomPlan[0].aliases, ["Kitchen", "cook"], "plan uses overrides when settings are empty"
 
 script.state.roomPlan = [
     [canonicalName: "Kitchen", aliases: ["Kitchen"], hubRoomId: 9L, matchCount: 1]
-]
-script.settings.put("roomAliases_0", "Kitchen, cook")
-script.applyRoomPageEdits()
-assertEq script.state.roomPlan[0].aliases, ["Kitchen", "cook"], "applyRoomPageEdits reads String-keyed alias settings"
-
-script.state.roomPlan = [
-    [canonicalName: "Kitchen", aliases: ["Kitchen", "cook"], hubRoomId: 9L, matchCount: 1]
 ]
 def mergeDevices = [[name: "Kitchen Light", roomId: null, isVirtual: false, depth: 0]]
 def mergeSeeded = [[
@@ -229,7 +236,25 @@ def mergeRooms = [[id: 9, name: "Kitchen"]]
 def merged = script.mergePlanWithDetections(mergeDevices, mergeSeeded, mergeRooms)
 def kitchenMerged = merged.find { script.normalizeLabel(it.canonicalName) == "kitchen" }
 assertTrue kitchenMerged != null, "Kitchen stays in merged plan"
-assertEq kitchenMerged.aliases, ["Kitchen", "cook"], "merge keeps previously edited aliases"
+assertEq kitchenMerged.aliases, ["Kitchen", "cook"], "merge prefers alias overrides over catalog"
+
+script.state.aliasOverrides = [:]
+script.state.roomPlan = [new LinkedHashMap(kitchenRoom)]
+script.settings.put("roomAliases_0", "Kitchen, migrated")
+script.applyRoomPageEdits()
+assertEq script.state.aliasOverrides["kitchen"], "Kitchen, migrated", "migrates old index-based alias settings"
+
+script.state.roomPlan = [new LinkedHashMap(kitchenRoom)]
+script.settings.put("roomAlias_kitchen", "Kitchen, cook, kit")
+script.handleSaveAliases()
+assertEq script.state.aliasOverrides["kitchen"], "Kitchen, cook, kit", "Save aliases stores the field value"
+assertTrue script.state.lastAliasOk == true, "Save aliases reports success"
+
+script.handleClearAliases("kitchen")
+assertEq script.state.aliasOverrides["kitchen"], "", "Clear aliases empties the override"
+assertEq script.settings["roomAlias_kitchen"], "", "Clear aliases empties the setting"
+assertEq script.state.roomPlan[0].aliases, ["Kitchen"], "Clear keeps the room name as the only alias"
+assertEq script.aliasesFromOverride(script.state.roomPlan[0]), ["Kitchen"], "empty override matches on room name only"
 
 script.state.hubRooms = []
 script.state.roomPlan = []
