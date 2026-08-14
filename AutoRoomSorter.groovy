@@ -14,7 +14,7 @@
  *
  * Never uses /device/updateRoom (name-based; can create junk rooms).
  *
- * Version: 1.3.7
+ * Version: 1.3.8
  */
 
 definition(
@@ -143,6 +143,7 @@ def roomsPage() {
         }
     }
     refreshScanIntoState()
+    applyRoomPageEdits()
     def plan = state.roomPlan ?: []
     def existingRooms = []
     def newRooms = []
@@ -152,6 +153,7 @@ def roomsPage() {
     }
     def willCreate = newRooms.count { roomIncludeValue(it.idx, it.room) }
     def collisions = findAliasCollisions(plan)
+    def nameCollisions = findRoomNameCollisions(plan, state.hubRooms ?: [])
 
     dynamicPage(name: "roomsPage", title: "Step 1 — Rooms", nextPage: "mainPage") {
         section {
@@ -176,6 +178,9 @@ ${badge("New", "#ef6c00")} Will create if checked<br>
 ${badge("Skipped", "#757575")} New room unchecked — won't create or auto-match"""
             if (collisions) {
                 paragraph calloutBox("<b>Alias collisions:</b> ${escapeHtml(collisions.join('; '))}", "danger")
+            }
+            if (nameCollisions) {
+                paragraph calloutBox("<b>Duplicate room names:</b> ${escapeHtml(nameCollisions.join('; '))}", "warning")
             }
         }
 
@@ -215,6 +220,10 @@ ${badge("Skipped", "#757575")} New room unchecked — won't create or auto-match
                     if (nameVal == null) nameVal = room.canonicalName
                     input nameKey, "text", title: "Room name",
                         defaultValue: nameVal.toString(), required: true, submitOnChange: true
+                    def sameNameCount = plan.count { normalizeLabel(it.canonicalName) == normalizeLabel(room.canonicalName) }
+                    if (sameNameCount > 1) {
+                        paragraph calloutBox("Another room in the plan uses this same name. Create will make only one room.", "warning")
+                    }
                     emitAliasInput(idx, room)
                 }
             }
@@ -248,7 +257,7 @@ ${badge("Skipped", "#757575")} New room unchecked — won't create or auto-match
             if (!acknowledgedRisk) {
                 paragraph calloutBox("Acknowledge the safety checkbox on the main page before creating rooms.", "danger")
             } else {
-                paragraph calloutBox("<b>Create Rooms</b> writes to the hub via undocumented endpoints. Existing rooms are never duplicated or renamed.", "warning")
+                paragraph calloutBox("<b>Create Rooms</b> writes to the hub via undocumented endpoints. A room name that already exists (ignoring case and punctuation) is reused — never duplicated or renamed.", "warning")
                 input "btnCreateRooms", "button", title: "Create Rooms"
             }
             if (state.lastCreateLog) {
@@ -733,7 +742,7 @@ def mergePlanWithDetections(devices, seeded, hubRooms) {
         }
         if (isUserAdded(prev) || isRememberedUserAdded(nkey)) entry.userAdded = true
         if ((entry.matchCount ?: 0) > 0 || entry.userAdded) {
-            def existing = hubRooms.find { normalizeLabel(it.name) == normalizeLabel(entry.canonicalName) }
+            def existing = existingRoomWithName(entry.canonicalName, hubRooms)
             if (existing) entry.hubRoomId = existing.id as Long
             plan << entry
         }
@@ -743,7 +752,7 @@ def mergePlanWithDetections(devices, seeded, hubRooms) {
     previous.each { nkey, prev ->
         if (!isUserAdded(prev) && !isRememberedUserAdded(nkey)) return
         if (plan.find { normalizeLabel(it.canonicalName) == nkey }) return
-        def existing = hubRooms.find { normalizeLabel(it.name) == normalizeLabel(prev.canonicalName) }
+        def existing = existingRoomWithName(prev.canonicalName, hubRooms)
         plan << [
             key: prev.canonicalName,
             canonicalName: prev.canonicalName,
@@ -811,7 +820,7 @@ def mergeUserAddedIntoPlan(List plan, List hubRooms) {
     loadUserAddedRooms().each { added ->
         def nkey = normalizeLabel(added.canonicalName)
         def existing = plan.find { normalizeLabel(it.canonicalName) == nkey }
-        def hub = (hubRooms ?: []).find { normalizeLabel(it.name) == nkey }
+        def hub = existingRoomWithName(added.canonicalName, hubRooms)
         if (existing) {
             existing.userAdded = true
             if (hub) {
@@ -1026,6 +1035,7 @@ def applyRoomPageEdits() {
             room.aliases = fromOverride
         }
     }
+    bindPlanRoomsToExistingHubRooms(plan, state.hubRooms ?: [])
     // Reassign copies so Hubitat persists nested alias/name edits in state
     state.roomPlan = plan.collect { entry ->
         def copy = new LinkedHashMap(entry)
@@ -1193,7 +1203,7 @@ def handleAddRoomButton() {
     def catalog = roomCatalog()
     aliases = ([name] + (catalog[name] ?: []) + aliases).unique()
     def hubRooms = (state.hubRooms ?: []) as List
-    def existing = hubRooms.find { normalizeLabel(it.name) == normalizeLabel(name) }
+    def existing = existingRoomWithName(name, hubRooms)
     def plan = new ArrayList(state.roomPlan ?: [])
     def entry = [
         key: name,
@@ -1227,7 +1237,9 @@ def handleAddRoomButton() {
         app.updateSetting(roomIncludeSettingName(name), [type: "bool", value: true])
     } catch (Exception ignored) { }
     state.lastAddRoomOk = true
-    state.lastAddRoomMessage = "Added ${name} to the plan."
+    state.lastAddRoomMessage = existing ?
+        "Added ${name} to the plan (already on the hub; will reuse, not duplicate)." :
+        "Added ${name} to the plan."
     log.info "Auto Room Sorter: added ${name} to the plan"
     clearAddRoomInputs()
 }
@@ -1256,8 +1268,12 @@ def handleCreateRooms() {
         return
     }
     applyRoomPageEdits()
-    def lines = []
+    def liveRooms = new ArrayList(fetchHubRooms() ?: [])
+    state.hubRooms = liveRooms
     def plan = state.roomPlan ?: []
+    bindPlanRoomsToExistingHubRooms(plan, liveRooms)
+    def lines = []
+    def createdIds = []
     logInfo "Creating rooms from plan (${plan.size()} entries)"
     plan.each { room ->
         if (room.hubRoomId) {
@@ -1268,13 +1284,33 @@ def handleCreateRooms() {
             lines << "SKIP (unchecked): ${room.canonicalName}"
             return
         }
+        def decision = resolveRoomCreate(room.canonicalName, liveRooms)
+        if (decision.action == "reuse") {
+            room.hubRoomId = decision.roomId as Long
+            lines << "SKIP (exists): ${room.canonicalName} id=${decision.roomId}"
+            logInfo "Reusing existing room ${room.canonicalName} id=${decision.roomId}"
+            return
+        }
+        if (decision.action != "create") {
+            lines << "SKIP (${decision.reason}): ${room.canonicalName}"
+            logWarn "Skip creating ${room.canonicalName}: ${decision.reason}"
+            return
+        }
         try {
             def resp = createRoom(room.canonicalName)
             def newId = resp?.roomId
             if (newId) {
                 room.hubRoomId = newId as Long
-                lines << "CREATED: ${room.canonicalName} id=${newId}"
-                logDebug "Created room ${room.canonicalName} id=${newId}"
+                if (resp?.reused) {
+                    lines << "SKIP (exists): ${room.canonicalName} id=${newId}"
+                    logInfo "Reusing existing room ${room.canonicalName} id=${newId}"
+                    liveRooms << [id: newId as Long, name: room.canonicalName]
+                } else {
+                    lines << "CREATED: ${room.canonicalName} id=${newId}"
+                    logDebug "Created room ${room.canonicalName} id=${newId}"
+                    liveRooms << [id: newId as Long, name: room.canonicalName]
+                    createdIds << (newId as Long)
+                }
             } else {
                 lines << "FAILED: ${room.canonicalName} — response ${resp}"
                 logError "Failed to create room ${room.canonicalName}: ${resp}"
@@ -1288,14 +1324,12 @@ def handleCreateRooms() {
     def hubRooms = fetchHubRooms()
     state.hubRooms = hubRooms
     plan.each { room ->
-        def existing = hubRooms.find { normalizeLabel(it.name) == normalizeLabel(room.canonicalName) }
+        def existing = existingRoomWithName(room.canonicalName, hubRooms)
         if (existing) room.hubRoomId = existing.id as Long
     }
     state.roomPlan = plan
     state.lastCreateLog = lines.join("\n")
-    state.lastCreatedRoomIds = plan.findAll { r ->
-        lines.any { it.startsWith("CREATED: ${r.canonicalName}") }
-    }.collect { it.hubRoomId }.findAll { it }
+    state.lastCreatedRoomIds = createdIds
     logInfo "Create rooms finished: ${(state.lastCreatedRoomIds ?: []).size()} created"
     refreshScanIntoState()
 }
@@ -1823,8 +1857,76 @@ List flattenHub2Devices(Map payload) {
     out.findAll { (it.name ?: "").trim() }
 }
 
+/** Find a hub/plan room whose name matches after normalizeLabel (case, punctuation, apostrophes). */
+Map existingRoomWithName(String name, List rooms) {
+    def key = normalizeLabel(name)
+    if (!key) return null
+    (rooms ?: []).find { entry ->
+        def entryName = (entry?.name ?: entry?.canonicalName)?.toString()
+        normalizeLabel(entryName) == key
+    }
+}
+
+def bindPlanRoomsToExistingHubRooms(List plan, List hubRooms) {
+    (plan ?: []).each { room ->
+        if (room.hubRoomId) return
+        def hit = existingRoomWithName(room.canonicalName, hubRooms)
+        def id = hit?.id ?: hit?.hubRoomId
+        if (id != null) {
+            room.hubRoomId = id as Long
+            room.fromHub = true
+        }
+    }
+}
+
+/** Decide whether a name should be created, reused, or skipped. Never returns create when the name is taken. */
+Map resolveRoomCreate(String name, List hubRooms) {
+    def trimmed = (name ?: "").toString().trim()
+    if (!trimmed) return [action: "skip", reason: "empty name"]
+    def existing = existingRoomWithName(trimmed, hubRooms)
+    if (existing) {
+        def id = existing.id ?: existing.hubRoomId
+        if (id != null) {
+            return [action: "reuse", roomId: id as Long, name: (existing.name ?: existing.canonicalName)]
+        }
+    }
+    [action: "create", name: trimmed]
+}
+
+List findRoomNameCollisions(List plan, List hubRooms = null) {
+    def warnings = []
+    def hub = hubRooms ?: []
+    def byKey = [:]
+    (plan ?: []).each { room ->
+        def key = normalizeLabel(room.canonicalName)
+        if (!key) return
+        byKey[key] = (byKey[key] ?: []) + [room.canonicalName]
+    }
+    byKey.each { key, names ->
+        if (names.size() > 1) {
+            warnings << "Name '${names[0]}' is used ${names.size()} times in the plan — only one room will be created"
+        }
+    }
+    (plan ?: []).findAll { !it.hubRoomId }.each { room ->
+        def hit = existingRoomWithName(room.canonicalName, hub)
+        if (hit) {
+            warnings << "'${room.canonicalName}' already exists on the hub as '${hit.name}' — will reuse, not create a duplicate"
+        }
+    }
+    warnings
+}
+
 Map createRoom(String name) {
-    hubPostJson("/room/save", [roomId: 0, name: name, deviceIds: []])
+    def live = fetchHubRooms()
+    def decision = resolveRoomCreate(name, live)
+    if (decision.action == "reuse") {
+        logInfo "Not creating duplicate room '${name}'; reusing '${decision.name}' id=${decision.roomId}"
+        return [roomId: decision.roomId as Long, reused: true]
+    }
+    if (decision.action != "create") {
+        throw new RuntimeException("Cannot create room '${name}': ${decision.reason}")
+    }
+    hubPostJson("/room/save", [roomId: 0, name: decision.name, deviceIds: []])
 }
 
 /**

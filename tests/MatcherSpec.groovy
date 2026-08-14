@@ -334,6 +334,97 @@ assertTrue script.roomIncludeValue(backyardIdx, backyardRoom) == true,
 assertEq script.settings[script.roomIncludeSettingName(backyardRoom)], true,
     "add-room sets the stable identity-based include setting directly"
 
+// ---------------------------------------------------------------------------
+// Duplicate room names must never be created
+// ---------------------------------------------------------------------------
+def kitchenHub = [id: 9L, name: "Kitchen"]
+assertEq script.existingRoomWithName("kitchen", [kitchenHub])?.id, 9L, "case-insensitive hub name match"
+assertEq script.existingRoomWithName("Kitchen!", [kitchenHub])?.id, 9L, "punctuation-normalized hub name match"
+assertEq script.existingRoomWithName("Gym", [kitchenHub]), null, "different name is not a match"
+assertEq script.existingRoomWithName("Saadyas Room", [[id: 11L, name: "Saadya's Room"]])?.id, 11L,
+    "apostrophe-normalized hub name match"
+
+def reuseDecision = script.resolveRoomCreate("Kitchen", [kitchenHub])
+assertEq reuseDecision.action, "reuse", "resolve reuses an existing hub room"
+assertEq reuseDecision.roomId, 9L, "reuse returns the existing id"
+
+def createDecision = script.resolveRoomCreate("Gym", [kitchenHub])
+assertEq createDecision.action, "create", "resolve creates when the name is free"
+assertEq createDecision.name, "Gym", "create keeps the trimmed name"
+assertEq script.resolveRoomCreate("  ", [kitchenHub]).action, "skip", "blank name is skipped"
+assertEq script.resolveRoomCreate(null, [kitchenHub]).reason, "empty name", "null name is skipped"
+
+def bindPlan = [
+    [canonicalName: "kitchen", hubRoomId: null],
+    [canonicalName: "Gym", hubRoomId: null]
+]
+script.bindPlanRoomsToExistingHubRooms(bindPlan, [kitchenHub])
+assertEq bindPlan[0].hubRoomId, 9L, "bind attaches the existing hub id"
+assertEq bindPlan[1].hubRoomId, null, "bind leaves a unique new room unbound"
+
+def nameCollisions = script.findRoomNameCollisions(
+    [
+        [canonicalName: "Gym", hubRoomId: null],
+        [canonicalName: "gym", hubRoomId: null],
+        [canonicalName: "Kitchen", hubRoomId: null]
+    ],
+    [kitchenHub]
+)
+assertTrue nameCollisions.any { it.toLowerCase().contains("gym") }, "collision warns on duplicate plan names"
+assertTrue nameCollisions.any { it.toLowerCase().contains("kitchen") }, "collision warns when a new name matches the hub"
+
+def createPosts = []
+script.metaClass.writeProbeOk = { -> true }
+script.metaClass.fetchHubRooms = { -> [[id: 1L, name: "Office"]] }
+script.metaClass.hubPostJson = { String path, Map body ->
+    createPosts << body
+    [roomId: 99L]
+}
+def reusedOffice = script.createRoom("office")
+assertEq reusedOffice.reused, true, "createRoom reports reused for an existing name"
+assertEq reusedOffice.roomId, 1L, "createRoom returns the existing id"
+assertEq createPosts.size(), 0, "createRoom must not POST when the name already exists"
+
+def createdSunroom = script.createRoom("Sunroom")
+assertEq createPosts.size(), 1, "createRoom POSTs when the name is new"
+assertEq createPosts[0].roomId, 0, "create uses roomId 0"
+assertEq createPosts[0].name, "Sunroom", "create uses the trimmed name"
+assertEq createdSunroom.roomId, 99L, "createRoom returns the new id"
+
+createPosts.clear()
+script.metaClass.fetchHubRooms = { -> [[id: 9L, name: "Kitchen"]] }
+script.metaClass.refreshScanIntoState = { -> }
+script.settings.acknowledgedRisk = true
+script.state.hubRooms = [[id: 9L, name: "Kitchen"]]
+script.state.roomPlan = [
+    [canonicalName: "Kitchen", hubRoomId: null, include: true],
+    [canonicalName: "Gym", hubRoomId: null, include: true],
+    [canonicalName: "gym", hubRoomId: null, include: true],
+    [canonicalName: "  ", hubRoomId: null, include: true]
+]
+script.handleCreateRooms()
+assertEq createPosts.collect { it.name }, ["Gym"], "Create Rooms POSTs only the first unique missing name"
+assertEq script.state.roomPlan.find { it.canonicalName == "Kitchen" }.hubRoomId, 9L, "Kitchen reuses the hub room"
+assertEq script.state.roomPlan.find { it.canonicalName == "Gym" }.hubRoomId, 99L, "Gym was created"
+assertEq script.state.roomPlan.find { it.canonicalName == "gym" }.hubRoomId, 99L, "second gym reuses the created Gym"
+assertTrue script.state.lastCreateLog.contains("SKIP (exists): Kitchen"), "log skip for existing Kitchen"
+assertTrue script.state.lastCreateLog.contains("CREATED: Gym"), "log create for Gym"
+assertTrue script.state.lastCreateLog.contains("SKIP (empty name)"), "log skip for blank name"
+assertEq script.state.lastCreatedRoomIds, [99L], "undo list includes only rooms actually created"
+
+script.state.hubRooms = [[id: 9L, name: "Kitchen"]]
+script.state.roomPlan = []
+script.state.userAddedRooms = []
+script.settings.addRoomName = "kitchen"
+script.settings.addFromCatalog = ""
+script.settings.addRoomAliases = ""
+script.handleAddRoomButton()
+def kitchenAdded = script.state.roomPlan.find { script.normalizeLabel(it.canonicalName) == "kitchen" }
+assertTrue kitchenAdded != null, "adding a hub room name still puts it on the plan"
+assertEq kitchenAdded.hubRoomId, 9L, "adding an existing hub name reuses that room id"
+assertTrue script.state.lastAddRoomMessage.toString().contains("already on the hub"),
+    "add-room message says the hub room will be reused"
+
 println "Assertions: ${assertions}, failures: ${failures}"
 if (failures > 0) System.exit(1)
 println "ALL PASSED"
