@@ -14,7 +14,7 @@
  *
  * Never uses /device/updateRoom (name-based; can create junk rooms).
  *
- * Version: 1.3.4
+ * Version: 1.3.5
  */
 
 definition(
@@ -146,15 +146,6 @@ def roomsPage() {
         state.pendingAddRoom = false
         handleAddRoomButton()
     }
-    if (state.pendingSaveAliases) {
-        state.pendingSaveAliases = false
-        handleSaveAliases()
-    }
-    if (state.pendingClearAliasKey) {
-        def suffix = state.pendingClearAliasKey
-        state.pendingClearAliasKey = null
-        handleClearAliases(suffix)
-    }
     refreshScanIntoState()
     def plan = state.roomPlan ?: []
     def existingRooms = []
@@ -167,6 +158,12 @@ def roomsPage() {
     def collisions = findAliasCollisions(plan)
 
     dynamicPage(name: "roomsPage", title: "Step 1 — Rooms", nextPage: "mainPage") {
+        section {
+            emitAliasFeedbackBanner()
+            paragraph "Edit aliases below, then tap <b>Save aliases</b>. A green confirmation appears at the top of this page (Hubitat apps cannot show phone toasts). <b>Clear aliases</b> on a room wipes the pre-filled list."
+            input "btnSaveAliases", "button", title: "Save aliases"
+        }
+
         section("Overview") {
             paragraph calloutBox(
                 "<b>${existingRooms.size()}</b> existing · <b>${newRooms.size()}</b> new detected · <b>${willCreate}</b> will be created",
@@ -178,14 +175,6 @@ ${badge("Skipped", "#757575")} New room unchecked — won't create or auto-match
             if (collisions) {
                 paragraph calloutBox("<b>Alias collisions:</b> ${escapeHtml(collisions.join('; '))}", "danger")
             }
-        }
-
-        section("Save alias edits") {
-            paragraph "Edit aliases on any room below, then tap <b>Save aliases</b>. Use <b>Clear aliases</b> on a room to wipe the pre-filled list (matching still uses the room name)."
-            if (state.lastAliasMessage) {
-                paragraph calloutBox(escapeHtml(state.lastAliasMessage.toString()), state.lastAliasOk ? "success" : "warning")
-            }
-            emitSaveAliasesButton("btnSaveAliases")
         }
 
         if (!plan) {
@@ -232,8 +221,9 @@ ${badge("Skipped", "#757575")} New room unchecked — won't create or auto-match
         applyRoomPageEdits()
 
         if (plan) {
-            section("Save alias edits") {
-                emitSaveAliasesButton("btnSaveAliasesBottom")
+            section {
+                emitAliasFeedbackBanner()
+                input "btnSaveAliasesBottom", "button", title: "Save aliases"
             }
         }
 
@@ -514,13 +504,14 @@ def resultsPage() {
 // ---------------------------------------------------------------------------
 
 def appButtonHandler(btn) {
-    def name = btn?.toString()
+    def name = normalizeAppButton(btn)
+    log.info "Auto Room Sorter button: ${name}"
     if (name == "btnSaveAliases" || name == "btnSaveAliasesBottom") {
-        state.pendingSaveAliases = true
+        handleSaveAliases()
         return
     }
-    if (name?.startsWith("btnClearAlias_")) {
-        state.pendingClearAliasKey = name.substring("btnClearAlias_".length())
+    if (name.startsWith("btnClearAlias_")) {
+        handleClearAliases(name.substring("btnClearAlias_".length()))
         return
     }
     switch (name) {
@@ -784,6 +775,58 @@ String aliasButtonSuffix(Object roomOrName) {
     roomOverrideKey(roomOrName).replaceAll("[^a-z0-9]+", "_")
 }
 
+String normalizeAppButton(btn) {
+    if (btn == null) return ""
+    if (btn instanceof Map) {
+        def keys = btn.keySet()
+        return keys ? keys.iterator().next().toString() : ""
+    }
+    def s = btn.toString()
+    def dot = s.indexOf(".")
+    if (dot > 0 && s.substring(0, dot).startsWith("btn")) return s.substring(0, dot)
+    s
+}
+
+def setAliasFeedback(boolean ok, String msg) {
+    state.lastAliasOk = ok
+    state.lastAliasMessage = msg
+    try {
+        atomicState.lastAliasOk = ok
+        atomicState.lastAliasMessage = msg
+    } catch (Exception ignored) { }
+}
+
+def aliasFeedbackMessage() {
+    def msg = state.lastAliasMessage
+    if (msg) return msg.toString()
+    try {
+        def am = atomicState.lastAliasMessage
+        if (am) return am.toString()
+    } catch (Exception ignored) { }
+    null
+}
+
+boolean aliasFeedbackOk() {
+    def v = state.lastAliasOk
+    if (v != null) return v != false
+    try {
+        return atomicState.lastAliasOk != false
+    } catch (Exception ignored) { }
+    true
+}
+
+def emitAliasFeedbackBanner() {
+    def msg = aliasFeedbackMessage()
+    if (!msg) return
+    def ok = aliasFeedbackOk()
+    def title = ok ? "✓ Aliases saved" : "✗ Aliases not saved"
+    if (msg.toLowerCase().contains("cleared")) title = ok ? "✓ Aliases cleared" : "✗ Clear failed"
+    paragraph calloutBox(
+        "<b style='font-size:1.2em;'>${title}</b><br>${escapeHtml(msg)}",
+        ok ? "success" : "danger"
+    )
+}
+
 List aliasesFromOverride(Object roomOrName) {
     def raw = (state.aliasOverrides ?: [:])[roomOverrideKey(roomOrName)]
     if (raw == null) return null
@@ -802,6 +845,9 @@ def putAliasOverride(Object roomOrName, String aliasStr) {
 def captureAliasOverrides() {
     def overrides = new LinkedHashMap(state.aliasOverrides ?: [:])
     def skip = state.clearedAliasKey
+    try {
+        if (!skip) skip = atomicState.clearedAliasKey
+    } catch (Exception ignored) { }
     (state.roomPlan ?: []).eachWithIndex { room, idx ->
         def nkey = roomOverrideKey(room)
         if (skip && nkey == skip) return
@@ -813,11 +859,7 @@ def captureAliasOverrides() {
     }
     state.aliasOverrides = overrides
     state.clearedAliasKey = null
-}
-
-def emitSaveAliasesButton(String name) {
-    input name.toString(), "button", title: "Save aliases", width: 12,
-        backgroundColor: "#2e7d32", textColor: "#ffffff"
+    try { atomicState.clearedAliasKey = null } catch (Exception ignored) { }
 }
 
 def emitAliasInput(idx, room) {
@@ -833,8 +875,7 @@ def emitAliasInput(idx, room) {
     }
     input key, "text", title: "Aliases (comma-separated)", required: false
     def clearBtn = ("btnClearAlias_" + aliasButtonSuffix(room)).toString()
-    input clearBtn, "button", title: "Clear aliases", width: 4,
-        backgroundColor: "#616161", textColor: "#ffffff"
+    input clearBtn, "button", title: "Clear aliases"
     def warnings = validateAliasList((settings[key] ?: current).toString())
     if (warnings) {
         paragraph calloutBox("Alias warnings: ${escapeHtml(warnings.join('; '))}", "warning")
@@ -842,29 +883,34 @@ def emitAliasInput(idx, room) {
 }
 
 def handleSaveAliases() {
-    applyRoomPageEdits()
-    (state.roomPlan ?: []).each { room ->
-        def raw = (state.aliasOverrides ?: [:])[roomOverrideKey(room)]
-        if (raw == null) return
-        try {
-            app.updateSetting(roomAliasSettingName(room), [type: "text", value: raw.toString()])
-        } catch (Exception ignored) { }
+    try {
+        applyRoomPageEdits()
+        (state.roomPlan ?: []).each { room ->
+            def raw = (state.aliasOverrides ?: [:])[roomOverrideKey(room)]
+            if (raw == null) return
+            try {
+                app.updateSetting(roomAliasSettingName(room), [type: "text", value: raw.toString()])
+            } catch (Exception ignored) { }
+        }
+        def n = (state.roomPlan ?: []).size()
+        def when = aliasFeedbackTime()
+        setAliasFeedback(true, "Saved aliases for ${n} room(s) at ${when}.")
+        log.info "Auto Room Sorter: saved aliases for ${n} room(s)"
+    } catch (Exception e) {
+        setAliasFeedback(false, "Save failed: ${e.message}")
+        log.error "Auto Room Sorter: save aliases failed: ${e.message}"
     }
-    def n = (state.roomPlan ?: []).size()
-    state.lastAliasOk = true
-    state.lastAliasMessage = "Saved aliases for ${n} room(s)."
-    logInfo "Saved aliases for ${n} room(s)"
 }
 
 def handleClearAliases(String suffix) {
     def room = (state.roomPlan ?: []).find { aliasButtonSuffix(it) == suffix }
     if (!room) {
-        state.lastAliasOk = false
-        state.lastAliasMessage = "Could not find that room to clear."
+        setAliasFeedback(false, "Could not find that room to clear.")
         return
     }
     def nkey = roomOverrideKey(room)
     state.clearedAliasKey = nkey
+    try { atomicState.clearedAliasKey = nkey } catch (Exception ignored) { }
     putAliasOverride(room, "")
     try {
         app.updateSetting(roomAliasSettingName(room), [type: "text", value: ""])
@@ -877,9 +923,16 @@ def handleClearAliases(String suffix) {
         }
         copy
     }
-    state.lastAliasOk = true
-    state.lastAliasMessage = "Cleared aliases for ${room.canonicalName}. Matching uses the room name only."
-    logInfo "Cleared aliases for ${room.canonicalName}"
+    setAliasFeedback(true, "Cleared aliases for ${room.canonicalName} at ${aliasFeedbackTime()}. Matching uses the room name only.")
+    log.info "Auto Room Sorter: cleared aliases for ${room.canonicalName}"
+}
+
+String aliasFeedbackTime() {
+    try {
+        return new Date().format("h:mm:ss a")
+    } catch (Exception ignored) {
+        return new Date().toString()
+    }
 }
 
 def applyRoomPageEdits() {

@@ -9,6 +9,7 @@ import org.codehaus.groovy.control.CompilerConfiguration
 
 abstract class HubitatStubScript extends Script {
     Map state = [:]
+    Map atomicState = [:]
     Map settings = [:]
     Expando app = new Expando(
         updateSetting: { String n, Map v -> settings[n] = v.value },
@@ -249,6 +250,7 @@ script.settings.put("roomAlias_kitchen", "Kitchen, cook, kit")
 script.handleSaveAliases()
 assertEq script.state.aliasOverrides["kitchen"], "Kitchen, cook, kit", "Save aliases stores the field value"
 assertTrue script.state.lastAliasOk == true, "Save aliases reports success"
+assertTrue script.aliasFeedbackMessage()?.contains("Saved aliases"), "Save aliases sets a visible confirmation"
 
 script.handleClearAliases("kitchen")
 assertEq script.state.aliasOverrides["kitchen"], "", "Clear aliases empties the override"
