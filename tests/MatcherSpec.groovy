@@ -307,6 +307,33 @@ script.applyRoomPageEdits()
 assertTrue(script.state.roomPlan.find { it.canonicalName == "Alpha Custom" } != null, "index-based roomName must not rename a newly added room")
 assertTrue(script.state.userAddedRooms.find { it.canonicalName == "Alpha Custom" } != null, "new room is remembered")
 
+// Regression: adding a custom room must not inherit a stale checkbox value
+// from whatever room previously occupied its new (post-sort) array index.
+script.state.userAddedRooms = []
+script.state.aliasOverrides = [:]
+script.state.roomPlan = [
+    [key: "Aardvark", canonicalName: "Aardvark", aliases: ["Aardvark"], hubRoomId: null, matchCount: 1, include: true],
+    [key: "Garage", canonicalName: "Garage", aliases: ["Garage"], hubRoomId: null, matchCount: 1, include: false]
+]
+// Legacy index-based settings as they would have been submitted on the prior render:
+// idx 0 = Aardvark (checked), idx 1 = Garage (unchecked).
+script.settings.put("roomInclude_0", true)
+script.settings.put("roomInclude_1", false)
+script.settings.addRoomName = "Backyard Room"
+script.settings.addFromCatalog = ""
+script.settings.addRoomAliases = ""
+script.handleAddRoomButton()
+// After the alphabetical resort, "Backyard Room" now lands at idx 1 — the slot
+// previously used by the unchecked "Garage" — so a naive index-based lookup
+// would incorrectly report it as unchecked.
+def backyardIdx = script.state.roomPlan.findIndexOf { it.canonicalName == "Backyard Room" }
+assertEq backyardIdx, 1, "Backyard Room sorts into the slot Garage used to occupy"
+def backyardRoom = script.state.roomPlan[backyardIdx]
+assertTrue script.roomIncludeValue(backyardIdx, backyardRoom) == true,
+    "newly added room must not inherit a stale checkbox value from its new array index"
+assertEq script.settings[script.roomIncludeSettingName(backyardRoom)], true,
+    "add-room sets the stable identity-based include setting directly"
+
 println "Assertions: ${assertions}, failures: ${failures}"
 if (failures > 0) System.exit(1)
 println "ALL PASSED"

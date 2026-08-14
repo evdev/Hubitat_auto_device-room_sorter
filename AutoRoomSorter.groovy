@@ -14,7 +14,7 @@
  *
  * Never uses /device/updateRoom (name-based; can create junk rooms).
  *
- * Version: 1.3.6
+ * Version: 1.3.7
  */
 
 definition(
@@ -206,7 +206,7 @@ ${badge("Skipped", "#757575")} New room unchecked — won't create or auto-match
                     def statusBadge = included ? badge("New", "#ef6c00") : badge("Skipped", "#757575")
                     def statusText = included ? "will create" : "unchecked — skipped"
                     paragraph "<b>${escapeHtml(room.canonicalName)}</b> — ${statusBadge} ${statusText} · ${room.matchCount ?: 0} matching device(s)"
-                    input settingKey("roomInclude", idx), "bool",
+                    input roomIncludeSettingName(room), "bool",
                         title: "Create this room",
                         defaultValue: true,
                         submitOnChange: true
@@ -765,6 +765,10 @@ String roomNameSettingName(Object roomOrName) {
     "roomName_${aliasButtonSuffix(roomOrName)}".toString()
 }
 
+String roomIncludeSettingName(Object roomOrName) {
+    "roomInclude_${aliasButtonSuffix(roomOrName)}".toString()
+}
+
 boolean isUserAdded(room) {
     def v = room?.userAdded
     v == true || v == "true" || v == 1 || v == "1"
@@ -1032,9 +1036,14 @@ def applyRoomPageEdits() {
     }
 }
 
+/** Stable identity-based key is checked first; legacy index-based key is a one-time migration fallback. */
 boolean roomIncludeValue(idx, room = null) {
-    def setting = settings[settingKey("roomInclude", idx)]
-    if (setting != null) return setting != false
+    if (room != null) {
+        def stable = settings[roomIncludeSettingName(room)]
+        if (stable != null) return stable != false
+    }
+    def legacy = settings[settingKey("roomInclude", idx)]
+    if (legacy != null) return legacy != false
     if (room?.include != null) return room.include != false
     true
 }
@@ -1169,6 +1178,7 @@ def clearAddRoomInputs() {
 }
 
 def handleAddRoomButton() {
+    applyRoomPageEdits()
     def customName = settingStr("addRoomName")
     def catalogName = settingStr("addFromCatalog")
     if (catalogName == "__none__") catalogName = ""
@@ -1210,6 +1220,11 @@ def handleAddRoomButton() {
     putAliasOverride(name, aliases.join(", "))
     try {
         app.updateSetting(roomAliasSettingName(name), [type: "text", value: aliases.join(", ")])
+    } catch (Exception ignored) { }
+    try {
+        // Guarantee the new room starts checked — never let it inherit a stale
+        // value from whatever room previously occupied this list position.
+        app.updateSetting(roomIncludeSettingName(name), [type: "bool", value: true])
     } catch (Exception ignored) { }
     state.lastAddRoomOk = true
     state.lastAddRoomMessage = "Added ${name} to the plan."
