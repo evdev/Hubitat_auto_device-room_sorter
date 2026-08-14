@@ -14,7 +14,7 @@
  *
  * Never uses /device/updateRoom (name-based; can create junk rooms).
  *
- * Version: 1.3.1
+ * Version: 1.3.2
  */
 
 definition(
@@ -142,6 +142,10 @@ def roomsPage() {
             section { paragraph calloutBox("Hub probe failed. Return to the main page.", "danger") }
         }
     }
+    if (state.pendingAddRoom) {
+        state.pendingAddRoom = false
+        handleAddRoomButton()
+    }
     refreshScanIntoState()
     def plan = state.roomPlan ?: []
     def existingRooms = []
@@ -180,12 +184,7 @@ ${badge("Skipped", "#757575")} New room unchecked — won't create or auto-match
                     def idx = entry.idx
                     paragraph "<b>${escapeHtml(room.canonicalName)}</b> — ${badge("Exists", "#2e7d32")} will reuse · ${room.matchCount ?: 0} matching device(s)"
                     paragraph "Name (read-only): ${escapeHtml(room.canonicalName)}"
-                    input "roomAliases_${idx}", "text", title: "Aliases (comma-separated)",
-                        defaultValue: (room.aliases ?: []).join(", "), required: false, submitOnChange: true
-                    def warnings = validateAliasList(settings["roomAliases_${idx}"] ?: (room.aliases ?: []).join(", "))
-                    if (warnings) {
-                        paragraph calloutBox("Alias warnings: ${escapeHtml(warnings.join('; '))}", "warning")
-                    }
+                    emitAliasInput(idx, room)
                 }
             }
         }
@@ -199,18 +198,16 @@ ${badge("Skipped", "#757575")} New room unchecked — won't create or auto-match
                     def statusBadge = included ? badge("New", "#ef6c00") : badge("Skipped", "#757575")
                     def statusText = included ? "will create" : "unchecked — skipped"
                     paragraph "<b>${escapeHtml(room.canonicalName)}</b> — ${statusBadge} ${statusText} · ${room.matchCount ?: 0} matching device(s)"
-                    input "roomInclude_${idx}", "bool",
+                    input settingKey("roomInclude", idx), "bool",
                         title: "Create this room",
                         defaultValue: true,
                         submitOnChange: true
-                    input "roomName_${idx}", "text", title: "Room name",
-                        defaultValue: room.canonicalName, required: true, submitOnChange: true
-                    input "roomAliases_${idx}", "text", title: "Aliases (comma-separated)",
-                        defaultValue: (room.aliases ?: []).join(", "), required: false, submitOnChange: true
-                    def warnings = validateAliasList(settings["roomAliases_${idx}"] ?: (room.aliases ?: []).join(", "))
-                    if (warnings) {
-                        paragraph calloutBox("Alias warnings: ${escapeHtml(warnings.join('; '))}", "warning")
-                    }
+                    def nameKey = settingKey("roomName", idx)
+                    def nameVal = settings[nameKey]
+                    if (nameVal == null) nameVal = room.canonicalName
+                    input nameKey, "text", title: "Room name",
+                        defaultValue: nameVal.toString(), required: true, submitOnChange: true
+                    emitAliasInput(idx, room)
                 }
             }
         }
@@ -219,10 +216,16 @@ ${badge("Skipped", "#757575")} New room unchecked — won't create or auto-match
 
         section("Add another room") {
             paragraph "Enter a custom name or pick from the catalog, then tap <b>Add room to plan</b>."
-            input "addRoomName", "text", title: "Custom room name", required: false, submitOnChange: true
+            if (state.lastAddRoomMessage) {
+                paragraph calloutBox(escapeHtml(state.lastAddRoomMessage.toString()), state.lastAddRoomOk ? "success" : "warning")
+            }
+            input "addRoomName", "text", title: "Custom room name", required: false
             input "addRoomAliases", "text", title: "Aliases (comma-separated)", required: false
+            def catalogOpts = new LinkedHashMap()
+            catalogOpts["__none__"] = "(none)"
+            roomCatalog().keySet().sort().each { catalogOpts[it] = it }
             input "addFromCatalog", "enum", title: "Or pick from catalog",
-                options: roomCatalog().keySet().sort(), required: false, submitOnChange: true
+                options: catalogOpts, required: false
             input "btnAddRoom", "button", title: "Add room to plan"
         }
 
@@ -330,14 +333,8 @@ ${badge("will skip", "#c62828")} Target is “room not created yet” — create
                         title: "Sort devices matched as ${roomName}",
                         defaultValue: true,
                         submitOnChange: true,
-                        width: 6
-                    input sortTargetSettingName(roomName), "enum",
-                        title: "Target room for ${roomName}",
-                        options: roomOpts,
-                        defaultValue: defaultTarget,
-                        required: false,
-                        submitOnChange: true,
-                        width: 6
+                        width: 12,
+                        newLineAfter: true
                     def notes = []
                     if (suggestedId && resolved && resolved.roomId.toString() != suggestedId.toString()) {
                         notes << "Suggested: <b>${escapeHtml(roomName)}</b> → sorting into <b>${escapeHtml(resolved.roomName)}</b>"
@@ -352,7 +349,15 @@ ${badge("will skip", "#c62828")} Target is “room not created yet” — create
                         "• ${escapeHtml(d.deviceName)}${flag}"
                     }.join("<br>")
                     def noteHtml = notes ? "<br>${notes.join('<br>')}" : ""
-                    paragraph "${statusBadge} ${devices.size()} device(s)${noteHtml}<br>${lines}", width: 12
+                    paragraph "${statusBadge} ${devices.size()} device(s)${noteHtml}<br>${lines}", width: 6
+                    input sortTargetSettingName(roomName), "enum",
+                        title: "Target room for ${roomName}",
+                        options: roomOpts,
+                        defaultValue: defaultTarget,
+                        required: false,
+                        submitOnChange: true,
+                        width: 6,
+                        newLineAfter: true
                 }
             }
         }
@@ -488,7 +493,7 @@ def resultsPage() {
 def appButtonHandler(btn) {
     switch (btn) {
         case "btnAddRoom":
-            handleAddRoomButton()
+            state.pendingAddRoom = true
             break
         case "btnCreateRooms":
             handleCreateRooms()
@@ -719,11 +724,29 @@ def mergePlanWithDetections(devices, seeded, hubRooms) {
             hubRoomId: existing?.id as Long,
             fromHub: !!existing,
             matchCount: 0,
-            userAdded: true
+            userAdded: true,
+            include: prev.include != false
         ]
     }
 
     plan.sort { a, b -> (a.canonicalName ?: "").toLowerCase() <=> (b.canonicalName ?: "").toLowerCase() }
+}
+
+/** Plain String key — Hubitat settings are Java maps; GString keys miss saved values. */
+String settingKey(String prefix, idx) {
+    "${prefix}_${idx}".toString()
+}
+
+def emitAliasInput(idx, room) {
+    def key = settingKey("roomAliases", idx)
+    def current = settings[key]
+    if (current == null) current = (room.aliases ?: []).join(", ")
+    input key, "text", title: "Aliases (comma-separated)",
+        defaultValue: current.toString(), required: false, submitOnChange: true
+    def warnings = validateAliasList(current.toString())
+    if (warnings) {
+        paragraph calloutBox("Alias warnings: ${escapeHtml(warnings.join('; '))}", "warning")
+    }
 }
 
 def applyRoomPageEdits() {
@@ -731,23 +754,30 @@ def applyRoomPageEdits() {
     if (!plan) return
     plan.eachWithIndex { room, idx ->
         if (!room.hubRoomId) {
-            def newName = settings["roomName_${idx}"]
+            def newName = settings[settingKey("roomName", idx)]
             if (newName) room.canonicalName = newName.toString().trim()
             room.include = roomIncludeValue(idx, room)
         } else {
             room.include = true
         }
-        def aliasStr = settings["roomAliases_${idx}"]
+        def aliasStr = settings[settingKey("roomAliases", idx)]
         if (aliasStr != null) {
             room.aliases = splitAliases(aliasStr)
             if (!room.aliases) room.aliases = [room.canonicalName]
         }
     }
-    state.roomPlan = plan
+    // Reassign copies so Hubitat persists nested alias/name edits in state
+    state.roomPlan = plan.collect { entry ->
+        def copy = new LinkedHashMap(entry)
+        if (copy.aliases instanceof Collection) {
+            copy.aliases = copy.aliases.collect { it }
+        }
+        copy
+    }
 }
 
 boolean roomIncludeValue(idx, room = null) {
-    def setting = settings["roomInclude_${idx}"]
+    def setting = settings[settingKey("roomInclude", idx)]
     if (setting != null) return setting != false
     if (room?.include != null) return room.include != false
     true
@@ -862,23 +892,50 @@ Map resolveSortTarget(String roomName) {
     null
 }
 
-def handleAddRoomButton() {
-    def name = (addFromCatalog ?: addRoomName ?: "").toString().trim()
-    if (!name) return
-    def aliases = splitAliases(addRoomAliases)
-    if (addFromCatalog && roomCatalog()[addFromCatalog]) {
-        aliases = ([addFromCatalog] + roomCatalog()[addFromCatalog] + aliases).unique()
-        name = addFromCatalog
+String settingStr(String name) {
+    def v = settings[name]
+    v == null ? "" : v.toString().trim()
+}
+
+def clearAddRoomInputs() {
+    ["addRoomName", "addRoomAliases"].each { n ->
+        try {
+            app.removeSetting(n)
+        } catch (Exception ignored) {
+            app.updateSetting(n, [type: "text", value: ""])
+        }
     }
-    if (!aliases) aliases = [name]
-    def hubRooms = state.hubRooms ?: fetchHubRooms()
+    try {
+        app.removeSetting("addFromCatalog")
+    } catch (Exception ignored) {
+        app.updateSetting("addFromCatalog", [type: "enum", value: "__none__"])
+    }
+}
+
+def handleAddRoomButton() {
+    def customName = settingStr("addRoomName")
+    def catalogName = settingStr("addFromCatalog")
+    if (catalogName == "__none__") catalogName = ""
+    // Typed custom name wins if both are filled — a sticky catalog enum used to swallow custom adds
+    def name = customName ?: catalogName
+    if (!name) {
+        state.lastAddRoomOk = false
+        state.lastAddRoomMessage = "Enter a custom room name or pick from the catalog, then tap Add room to plan."
+        return
+    }
+    def aliases = splitAliases(settings["addRoomAliases"])
+    def catalog = roomCatalog()
+    aliases = ([name] + (catalog[name] ?: []) + aliases).unique()
+    def hubRooms = (state.hubRooms ?: []) as List
     def existing = hubRooms.find { normalizeLabel(it.name) == normalizeLabel(name) }
-    def plan = state.roomPlan ?: []
+    def plan = new ArrayList(state.roomPlan ?: [])
     if (plan.find { normalizeLabel(it.canonicalName) == normalizeLabel(name) }) {
+        state.lastAddRoomOk = false
+        state.lastAddRoomMessage = "${name} is already in the plan."
         logInfo "Room already in plan: ${name}"
         return
     }
-    plan << [
+    plan.add([
         key: name,
         canonicalName: name,
         aliases: aliases,
@@ -887,11 +944,13 @@ def handleAddRoomButton() {
         matchCount: 0,
         userAdded: true,
         include: true
-    ]
-    state.roomPlan = plan.sort { it.canonicalName?.toLowerCase() }
-    app.updateSetting("addRoomName", [type: "text", value: ""])
-    app.updateSetting("addRoomAliases", [type: "text", value: ""])
-    app.updateSetting("addFromCatalog", [type: "enum", value: ""])
+    ])
+    state.roomPlan = plan.sort { a, b ->
+        (a.canonicalName ?: "").toLowerCase() <=> (b.canonicalName ?: "").toLowerCase()
+    }
+    state.lastAddRoomOk = true
+    state.lastAddRoomMessage = "Added ${name} to the plan."
+    clearAddRoomInputs()
 }
 
 def handleAddLeftovers() {

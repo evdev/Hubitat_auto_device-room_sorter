@@ -10,7 +10,10 @@ import org.codehaus.groovy.control.CompilerConfiguration
 abstract class HubitatStubScript extends Script {
     Map state = [:]
     Map settings = [:]
-    Expando app = new Expando(updateSetting: { String n, Map v -> settings[n] = v.value })
+    Expando app = new Expando(
+        updateSetting: { String n, Map v -> settings[n] = v.value },
+        removeSetting: { String n -> settings.remove(n) }
+    )
     Expando log = new Expando(
         debug: { Object m -> },
         info: { Object m -> },
@@ -202,6 +205,61 @@ def ambTargets = [
 def amb = script.matchLabelAgainstTargets("Shared Light", ambTargets)
 assertTrue amb?.ambiguous == true, "shared alias should be ambiguous"
 assertTrue amb?.canonicalName in ["Alpha Room", "Beta Room"], "ambiguous still picks a candidate"
+
+def aliasKey = script.settingKey("roomAliases", 0)
+assertEq aliasKey, "roomAliases_0", "settingKey format"
+assertTrue aliasKey instanceof String, "settingKey must be a plain String"
+assertTrue !(aliasKey instanceof GString), "settingKey must not be a GString"
+
+script.state.roomPlan = [
+    [canonicalName: "Kitchen", aliases: ["Kitchen"], hubRoomId: 9L, matchCount: 1]
+]
+script.settings.put("roomAliases_0", "Kitchen, cook")
+script.applyRoomPageEdits()
+assertEq script.state.roomPlan[0].aliases, ["Kitchen", "cook"], "applyRoomPageEdits reads String-keyed alias settings"
+
+script.state.roomPlan = [
+    [canonicalName: "Kitchen", aliases: ["Kitchen", "cook"], hubRoomId: 9L, matchCount: 1]
+]
+def mergeDevices = [[name: "Kitchen Light", roomId: null, isVirtual: false, depth: 0]]
+def mergeSeeded = [[
+    key: "Kitchen", canonicalName: "Kitchen", aliases: ["Kitchen", "kitchen"], hubRoomId: 9L
+]]
+def mergeRooms = [[id: 9, name: "Kitchen"]]
+def merged = script.mergePlanWithDetections(mergeDevices, mergeSeeded, mergeRooms)
+def kitchenMerged = merged.find { script.normalizeLabel(it.canonicalName) == "kitchen" }
+assertTrue kitchenMerged != null, "Kitchen stays in merged plan"
+assertEq kitchenMerged.aliases, ["Kitchen", "cook"], "merge keeps previously edited aliases"
+
+script.state.hubRooms = []
+script.state.roomPlan = []
+script.settings.addRoomName = "Music Studio"
+script.settings.addFromCatalog = "Kitchen"
+script.settings.addRoomAliases = "studio loft"
+script.handleAddRoomButton()
+def customAdded = script.state.roomPlan.find { it.canonicalName == "Music Studio" }
+assertTrue customAdded != null, "custom room is added to the plan"
+assertTrue customAdded.userAdded == true, "custom room is marked userAdded"
+assertTrue customAdded.aliases.contains("Music Studio"), "canonical name is an alias"
+assertTrue customAdded.aliases.contains("studio loft"), "custom aliases kept"
+assertEq script.state.roomPlan.find { it.canonicalName == "Kitchen" }, null, "typed name wins over catalog enum"
+assertEq script.settings.addRoomName, null, "add form is cleared after success"
+
+script.settings.addRoomName = "Music Studio"
+script.handleAddRoomButton()
+assertEq script.state.roomPlan.count { it.canonicalName == "Music Studio" }, 1, "duplicate custom room is not added"
+assertTrue script.state.lastAddRoomOk == false, "duplicate add reports already in plan"
+
+script.settings.addRoomName = ""
+script.settings.addFromCatalog = "Gym"
+script.handleAddRoomButton()
+def gymAdded = script.state.roomPlan.find { it.canonicalName == "Gym" }
+assertTrue gymAdded != null, "catalog pick still adds when custom name is empty"
+assertTrue gymAdded.aliases.contains("exercise room"), "catalog aliases inherited"
+
+def mergedCustom = script.mergePlanWithDetections([], [], [])
+assertTrue(mergedCustom.find { it.canonicalName == "Music Studio" && it.userAdded } != null, "merge keeps user-added custom room")
+assertTrue(mergedCustom.find { it.canonicalName == "Gym" && it.userAdded } != null, "merge keeps user-added catalog room")
 
 println "Assertions: ${assertions}, failures: ${failures}"
 if (failures > 0) System.exit(1)
