@@ -288,6 +288,25 @@ def mergedCustom = script.mergePlanWithDetections([], [], [])
 assertTrue(mergedCustom.find { it.canonicalName == "Music Studio" && it.userAdded } != null, "merge keeps user-added custom room")
 assertTrue(mergedCustom.find { it.canonicalName == "Gym" && it.userAdded } != null, "merge keeps user-added catalog room")
 
+script.state.roomPlan = []
+def revived = script.mergePlanWithDetections([], [], [])
+assertTrue(revived.find { it.canonicalName == "Music Studio" } != null, "userAddedRooms restores custom room after plan wipe")
+assertTrue(revived.find { it.canonicalName == "Gym" } != null, "userAddedRooms restores catalog pick after plan wipe")
+
+script.state.userAddedRooms = []
+script.state.roomPlan = [
+    [key: "Kitchen", canonicalName: "Kitchen", aliases: ["Kitchen"], hubRoomId: null, matchCount: 1]
+]
+script.settings.put("roomName_0", "Kitchen")
+script.settings.addRoomName = "Alpha Custom"
+script.settings.addFromCatalog = ""
+script.settings.addRoomAliases = ""
+script.handleAddRoomButton()
+script.settings.put("roomName_0", "Kitchen")
+script.applyRoomPageEdits()
+assertTrue(script.state.roomPlan.find { it.canonicalName == "Alpha Custom" } != null, "index-based roomName must not rename a newly added room")
+assertTrue(script.state.userAddedRooms.find { it.canonicalName == "Alpha Custom" } != null, "new room is remembered")
+
 println "Assertions: ${assertions}, failures: ${failures}"
 if (failures > 0) System.exit(1)
 println "ALL PASSED"

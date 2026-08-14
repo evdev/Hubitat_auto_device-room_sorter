@@ -14,7 +14,7 @@
  *
  * Never uses /device/updateRoom (name-based; can create junk rooms).
  *
- * Version: 1.3.5
+ * Version: 1.3.6
  */
 
 definition(
@@ -142,10 +142,6 @@ def roomsPage() {
             section { paragraph calloutBox("Hub probe failed. Return to the main page.", "danger") }
         }
     }
-    if (state.pendingAddRoom) {
-        state.pendingAddRoom = false
-        handleAddRoomButton()
-    }
     refreshScanIntoState()
     def plan = state.roomPlan ?: []
     def existingRooms = []
@@ -160,6 +156,12 @@ def roomsPage() {
     dynamicPage(name: "roomsPage", title: "Step 1 — Rooms", nextPage: "mainPage") {
         section {
             emitAliasFeedbackBanner()
+            if (state.lastAddRoomMessage) {
+                paragraph calloutBox(
+                    "<b>${state.lastAddRoomOk ? '✓ Added to plan' : '✗ Not added'}</b><br>${escapeHtml(state.lastAddRoomMessage.toString())}",
+                    state.lastAddRoomOk ? "success" : "warning"
+                )
+            }
             paragraph "Edit aliases below, then tap <b>Save aliases</b>. A green confirmation appears at the top of this page (Hubitat apps cannot show phone toasts). <b>Clear aliases</b> on a room wipes the pre-filled list."
             input "btnSaveAliases", "button", title: "Save aliases"
         }
@@ -208,7 +210,7 @@ ${badge("Skipped", "#757575")} New room unchecked — won't create or auto-match
                         title: "Create this room",
                         defaultValue: true,
                         submitOnChange: true
-                    def nameKey = settingKey("roomName", idx)
+                    def nameKey = roomNameSettingName(room)
                     def nameVal = settings[nameKey]
                     if (nameVal == null) nameVal = room.canonicalName
                     input nameKey, "text", title: "Room name",
@@ -516,7 +518,7 @@ def appButtonHandler(btn) {
     }
     switch (name) {
         case "btnAddRoom":
-            state.pendingAddRoom = true
+            handleAddRoomButton()
             break
         case "btnCreateRooms":
             handleCreateRooms()
@@ -729,7 +731,7 @@ def mergePlanWithDetections(devices, seeded, hubRooms) {
             entry.canonicalName = prev.canonicalName
             entry.userAdded = prev.userAdded
         }
-        if (prev?.userAdded) entry.userAdded = true
+        if (isUserAdded(prev) || isRememberedUserAdded(nkey)) entry.userAdded = true
         if ((entry.matchCount ?: 0) > 0 || entry.userAdded) {
             def existing = hubRooms.find { normalizeLabel(it.name) == normalizeLabel(entry.canonicalName) }
             if (existing) entry.hubRoomId = existing.id as Long
@@ -739,7 +741,7 @@ def mergePlanWithDetections(devices, seeded, hubRooms) {
 
     // Preserve user-added rooms that are not in catalog/seed targets
     previous.each { nkey, prev ->
-        if (!prev.userAdded) return
+        if (!isUserAdded(prev) && !isRememberedUserAdded(nkey)) return
         if (plan.find { normalizeLabel(it.canonicalName) == nkey }) return
         def existing = hubRooms.find { normalizeLabel(it.name) == normalizeLabel(prev.canonicalName) }
         plan << [
@@ -754,7 +756,75 @@ def mergePlanWithDetections(devices, seeded, hubRooms) {
         ]
     }
 
+    mergeUserAddedIntoPlan(plan, hubRooms)
+
     plan.sort { a, b -> (a.canonicalName ?: "").toLowerCase() <=> (b.canonicalName ?: "").toLowerCase() }
+}
+
+String roomNameSettingName(Object roomOrName) {
+    "roomName_${aliasButtonSuffix(roomOrName)}".toString()
+}
+
+boolean isUserAdded(room) {
+    def v = room?.userAdded
+    v == true || v == "true" || v == 1 || v == "1"
+}
+
+boolean isRememberedUserAdded(String nkey) {
+    loadUserAddedRooms().any { normalizeLabel(it.canonicalName) == nkey }
+}
+
+Map copyRoomEntry(entry) {
+    def copy = new LinkedHashMap(entry)
+    if (copy.aliases instanceof Collection) {
+        copy.aliases = copy.aliases.collect { it }
+    }
+    copy
+}
+
+List loadUserAddedRooms() {
+    def list = state.userAddedRooms
+    if (list instanceof Collection && list) return list as List
+    try {
+        def fromAtomic = atomicState.userAddedRooms
+        if (fromAtomic instanceof Collection && fromAtomic) return fromAtomic as List
+    } catch (Exception ignored) { }
+    []
+}
+
+def rememberUserAddedRoom(Map room) {
+    def copy = copyRoomEntry(room)
+    copy.userAdded = true
+    def nkey = normalizeLabel(copy.canonicalName)
+    def list = loadUserAddedRooms().findAll { normalizeLabel(it.canonicalName) != nkey }
+    list = new ArrayList(list)
+    list.add(copy)
+    state.userAddedRooms = list
+    try { atomicState.userAddedRooms = list } catch (Exception ignored) { }
+}
+
+def mergeUserAddedIntoPlan(List plan, List hubRooms) {
+    loadUserAddedRooms().each { added ->
+        def nkey = normalizeLabel(added.canonicalName)
+        def existing = plan.find { normalizeLabel(it.canonicalName) == nkey }
+        def hub = (hubRooms ?: []).find { normalizeLabel(it.name) == nkey }
+        if (existing) {
+            existing.userAdded = true
+            if (hub) {
+                existing.hubRoomId = hub.id as Long
+                existing.fromHub = true
+            }
+        } else {
+            def copy = copyRoomEntry(added)
+            copy.userAdded = true
+            copy.include = copy.include != false
+            if (hub) {
+                copy.hubRoomId = hub.id as Long
+                copy.fromHub = true
+            }
+            plan << copy
+        }
+    }
 }
 
 /** Plain String key — Hubitat settings are Java maps; GString keys miss saved values. */
@@ -941,7 +1011,7 @@ def applyRoomPageEdits() {
     if (!plan) return
     plan.eachWithIndex { room, idx ->
         if (!room.hubRoomId) {
-            def newName = settings[settingKey("roomName", idx)]
+            def newName = settings[roomNameSettingName(room)]
             if (newName) room.canonicalName = newName.toString().trim()
             room.include = roomIncludeValue(idx, room)
         } else {
@@ -1115,13 +1185,7 @@ def handleAddRoomButton() {
     def hubRooms = (state.hubRooms ?: []) as List
     def existing = hubRooms.find { normalizeLabel(it.name) == normalizeLabel(name) }
     def plan = new ArrayList(state.roomPlan ?: [])
-    if (plan.find { normalizeLabel(it.canonicalName) == normalizeLabel(name) }) {
-        state.lastAddRoomOk = false
-        state.lastAddRoomMessage = "${name} is already in the plan."
-        logInfo "Room already in plan: ${name}"
-        return
-    }
-    plan.add([
+    def entry = [
         key: name,
         canonicalName: name,
         aliases: aliases,
@@ -1130,16 +1194,26 @@ def handleAddRoomButton() {
         matchCount: 0,
         userAdded: true,
         include: true
-    ])
+    ]
+    if (plan.find { normalizeLabel(it.canonicalName) == normalizeLabel(name) } ||
+        isRememberedUserAdded(normalizeLabel(name))) {
+        state.lastAddRoomOk = false
+        state.lastAddRoomMessage = "${name} is already in the plan."
+        log.info "Auto Room Sorter: room already in plan: ${name}"
+        return
+    }
+    plan.add(entry)
     state.roomPlan = plan.sort { a, b ->
         (a.canonicalName ?: "").toLowerCase() <=> (b.canonicalName ?: "").toLowerCase()
     }
+    rememberUserAddedRoom(entry)
     putAliasOverride(name, aliases.join(", "))
     try {
         app.updateSetting(roomAliasSettingName(name), [type: "text", value: aliases.join(", ")])
     } catch (Exception ignored) { }
     state.lastAddRoomOk = true
     state.lastAddRoomMessage = "Added ${name} to the plan."
+    log.info "Auto Room Sorter: added ${name} to the plan"
     clearAddRoomInputs()
 }
 
