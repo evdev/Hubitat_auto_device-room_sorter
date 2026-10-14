@@ -14,7 +14,7 @@
  *
  * Never uses /device/updateRoom (name-based; can create junk rooms).
  *
- * Version: 1.3.8
+ * Version: 1.3.10
  */
 
 definition(
@@ -27,6 +27,11 @@ definition(
     iconX2Url: "",
     iconX3Url: "",
     singleInstance: true,
+    // Schedules do not run until the app is installed. Sort depends on runIn.
+    installOnOpen: true,
+    // Page refresh and applyNextBatch both write state. One wake at a time
+    // so a refresh cannot save an older copy of the queue over a live sort.
+    singleThreaded: true,
     importUrl: "https://raw.githubusercontent.com/evdev/Hubitat_auto_device-room_sorter/main/AutoRoomSorter.groovy"
 )
 
@@ -48,12 +53,17 @@ def mainPage() {
     state.lastProbeOk = probe.ok
     state.lastProbeMessage = probe.message
 
-    if (probe.ok) {
+    if (probe.ok && !hubWriteInProgress()) {
         refreshScanIntoState()
     }
 
     dynamicPage(name: "mainPage", title: "Auto Room Sorter", install: true, uninstall: true) {
         section("Status") {
+            if (state.applyInProgress) {
+                paragraph calloutBox("<b>Sort in progress…</b> ${escapeHtml(state.applyProgress ?: '')}", "info")
+            } else if (state.undoInProgress) {
+                paragraph calloutBox("<b>Undo in progress…</b> ${escapeHtml(state.lastUndoLog ?: '')}", "info")
+            }
             if (probe.ok) {
                 paragraph calloutBox("<b>✓ Connected</b> — ${escapeHtml(probe.message)}", "success")
             } else {
@@ -142,8 +152,10 @@ def roomsPage() {
             section { paragraph calloutBox("Hub probe failed. Return to the main page.", "danger") }
         }
     }
-    refreshScanIntoState()
-    applyRoomPageEdits()
+    if (!hubWriteInProgress()) {
+        refreshScanIntoState()
+        applyRoomPageEdits()
+    }
     def plan = state.roomPlan ?: []
     def existingRooms = []
     def newRooms = []
@@ -213,7 +225,7 @@ ${badge("Skipped", "#757575")} New room unchecked — won't create or auto-match
                     paragraph "<b>${escapeHtml(room.canonicalName)}</b> — ${statusBadge} ${statusText} · ${room.matchCount ?: 0} matching device(s)"
                     input roomIncludeSettingName(room), "bool",
                         title: "Create this room",
-                        defaultValue: true,
+                        defaultValue: included,
                         submitOnChange: true
                     def nameKey = roomNameSettingName(room)
                     def nameVal = settings[nameKey]
@@ -275,9 +287,16 @@ def previewPage() {
         }
     }
     clearStaleApplyLock()
-    if (!state.applyInProgress) {
-        refreshScanIntoState()
+    clearStaleUndoLock()
+    // A full Step 2 render writes state and can take longer than the one-second
+    // schedule. While a sort or undo is running, show only progress.
+    if (state.applyInProgress) {
+        return sortInProgressPage("previewPage", "Step 2 — Preview & sort")
     }
+    if (state.undoInProgress) {
+        return undoInProgressPage("previewPage", "Step 2 — Preview & sort")
+    }
+    refreshScanIntoState()
     def matches = (state.matchPreview ?: []).findAll { it.proposedRoomKey }
     def byRoom = matches.groupBy { it.proposedRoomName }
     def roomOrder = byRoom.keySet().sort { it?.toLowerCase() }
@@ -309,9 +328,8 @@ def previewPage() {
             effectiveSortTarget(roomName) == sortTargetSkipValue()
     }
     def missingRoomCount = missingRoomGroups.size()
-    def refresh = state.applyInProgress ? 5 : 0
 
-    dynamicPage(name: "previewPage", title: "Step 2 — Preview & sort", refreshInterval: refresh, nextPage: "mainPage") {
+    dynamicPage(name: "previewPage", title: "Step 2 — Preview & sort", nextPage: "mainPage") {
         section("Overview") {
             paragraph calloutBox(
                 "<b>${matches.size()}</b> matched device(s) across <b>${byRoom.size()}</b> room(s) · <b>${excluded.size()}</b> excluded · <b>${willSortCount}</b> ready to sort",
@@ -355,7 +373,7 @@ ${badge("will skip", "#c62828")} Target is “room not created yet” — create
                     }
                     input sortRoomSettingName(roomName), "bool",
                         title: "Sort devices matched as ${roomName}",
-                        defaultValue: true,
+                        defaultValue: included,
                         submitOnChange: true,
                         width: 12,
                         newLineAfter: true
@@ -398,43 +416,63 @@ ${badge("will skip", "#c62828")} Target is “room not created yet” — create
         }
 
         section("Sort") {
-            if (state.applyInProgress) {
-                paragraph calloutBox(
-                    "<b>Sort in progress…</b> ${escapeHtml(state.applyProgress ?: '')}<br>This page refreshes automatically. Open Results to watch the log or cancel.",
-                    "info"
-                )
-                href "resultsPage", title: "View progress / Cancel"
-            } else {
-                def progress = state.applyProgress?.toString() ?: ""
-                if (progress) {
-                    def lower = progress.toLowerCase()
-                    if (lower.contains("done") || lower.contains("cancel") || lower.contains("timed out") || lower.contains("fail")) {
-                        def kind = lower.contains("done") ? "success" :
-                            (lower.contains("cancel") || lower.contains("timed out") || lower.contains("fail") ? "warning" : "info")
-                        paragraph calloutBox("<b>${escapeHtml(progress)}</b>", kind)
-                    }
+            def progress = state.applyProgress?.toString() ?: ""
+            if (progress) {
+                def lower = progress.toLowerCase()
+                if (lower.contains("done") || lower.contains("cancel") || lower.contains("timed out") || lower.contains("fail")) {
+                    def kind = lower.contains("done") ? "success" :
+                        (lower.contains("cancel") || lower.contains("timed out") || lower.contains("fail") ? "warning" : "info")
+                    paragraph calloutBox("<b>${escapeHtml(progress)}</b>", kind)
                 }
-                if (!acknowledgedRisk) {
-                    paragraph calloutBox("Acknowledge the safety checkbox on the main page before sorting.", "danger")
-                } else {
-                    paragraph calloutBox(
-                        "<b>Sort Devices</b> will assign about <b>${willSortCount}</b> device(s) into <b>${includedRooms.size()}</b> room(s). Already-assigned devices are never moved. Writes use undocumented hub endpoints.",
-                        "warning"
-                    )
-                    input "btnSortDevices", "button", title: "Sort Devices"
-                }
-                href "resultsPage", title: "Results / Undo",
-                    description: "View the last sort log or undo it"
             }
+            if (!acknowledgedRisk) {
+                paragraph calloutBox("Acknowledge the safety checkbox on the main page before sorting.", "danger")
+            } else {
+                paragraph calloutBox(
+                    "<b>Sort Devices</b> will assign about <b>${willSortCount}</b> device(s) into <b>${includedRooms.size()}</b> room(s). Already-assigned devices are never moved. Writes use undocumented hub endpoints.",
+                    "warning"
+                )
+                input "btnSortDevices", "button", title: "Sort Devices"
+            }
+            href "resultsPage", title: "Results / Undo",
+                description: "View the last sort log or undo it"
         }
     }
 }
 
+def sortInProgressPage(String pageName, String title) {
+    dynamicPage(name: pageName, title: title, refreshInterval: 5, nextPage: "mainPage") {
+        section("Sort") {
+            paragraph calloutBox(
+                "<b>Sort in progress…</b> ${escapeHtml(state.applyProgress ?: '')}<br>This page refreshes automatically. Open Results to watch the log or cancel.",
+                "info"
+            )
+            href "resultsPage", title: "View progress / Cancel"
+        }
+    }
+}
+
+def undoInProgressPage(String pageName, String title) {
+    dynamicPage(name: pageName, title: title, refreshInterval: 5, nextPage: "mainPage") {
+        section("Undo") {
+            paragraph calloutBox(
+                "<b>Undo in progress…</b> ${escapeHtml(state.lastUndoLog ?: '')}<br>Open Results to watch the log or cancel.",
+                "info"
+            )
+            href "resultsPage", title: "View progress / Cancel"
+        }
+    }
+}
+
+boolean hubWriteInProgress() {
+    !!(state.applyInProgress || state.undoInProgress)
+}
+
 def leftoversPage() {
-    refreshScanIntoState()
+    if (!hubWriteInProgress()) refreshScanIntoState()
     def unmatched = (state.matchPreview ?: []).findAll { !it.proposedRoomKey }
     def rooms = (state.hubRooms ?: []) + (state.roomPlan ?: []).findAll { it.hubRoomId }.collect { [id: it.hubRoomId, name: it.canonicalName] }
-    rooms = rooms.unique { it.id }.sort { it.name?.toLowerCase() }
+    rooms = rooms.unique { it.id?.toString() }.sort { it.name?.toLowerCase() }
     def roomOpts = rooms.collectEntries { [(it.id.toString()): it.name] }
     def deviceOpts = unmatched.collectEntries { [(it.deviceId.toString()): it.deviceName] }
     def manual = state.manualAssignments ?: [:]
@@ -446,6 +484,12 @@ def leftoversPage() {
                 "info"
             )
             paragraph "Pick a target room, select devices, then tap <b>Add to plan</b>. Assignments are applied when you Sort on Step 2."
+            if (state.lastLeftoverMessage) {
+                paragraph calloutBox(
+                    escapeHtml(state.lastLeftoverMessage.toString()),
+                    state.lastLeftoverOk ? "success" : "warning"
+                )
+            }
         }
         section("Current manual assignments") {
             if (!manual) {
@@ -470,8 +514,10 @@ def leftoversPage() {
 
 def resultsPage() {
     clearStaleApplyLock()
-    def refresh = state.applyInProgress ? 5 : 0
-    dynamicPage(name: "resultsPage", title: "Results", refreshInterval: refresh, nextPage: "mainPage") {
+    clearStaleUndoLock()
+    def opts = [name: "resultsPage", title: "Results", nextPage: "mainPage"]
+    if (state.applyInProgress || state.undoInProgress) opts.refreshInterval = 5
+    dynamicPage(opts) {
         section("Status") {
             if (state.applyInProgress) {
                 paragraph calloutBox("<b>Sort in progress…</b> ${escapeHtml(state.applyProgress ?: '')}", "info")
@@ -493,7 +539,10 @@ def resultsPage() {
             }
         }
         section("Undo") {
-            if (state.lastRun?.undo) {
+            if (state.undoInProgress) {
+                paragraph calloutBox("<b>Undo in progress…</b> Open this page to watch it. Each batch restores a few devices.", "info")
+                input "btnCancelUndo", "button", title: "Cancel undo"
+            } else if (state.lastRun?.undo) {
                 paragraph calloutBox(
                     "Undo restores each device's previous room from the last sort. Optionally delete rooms created in that run if they are now empty.",
                     "warning"
@@ -546,6 +595,9 @@ def appButtonHandler(btn) {
             break
         case "btnUndoSort":
             handleUndo()
+            break
+        case "btnCancelUndo":
+            cancelUndo()
             break
     }
 }
@@ -1024,9 +1076,17 @@ def applyRoomPageEdits() {
     if (!plan) return
     plan.eachWithIndex { room, idx ->
         if (!room.hubRoomId) {
+            def included = roomIncludeValue(idx, room)
+            def oldName = room.canonicalName?.toString()
             def newName = settings[roomNameSettingName(room)]
-            if (newName) room.canonicalName = newName.toString().trim()
-            room.include = roomIncludeValue(idx, room)
+            if (newName) {
+                def trimmed = newName.toString().trim()
+                if (trimmed) room.canonicalName = trimmed
+            }
+            if (oldName && room.canonicalName && normalizeLabel(oldName) != normalizeLabel(room.canonicalName)) {
+                migrateRoomSettings(oldName, room.canonicalName.toString())
+            }
+            room.include = included
         } else {
             room.include = true
         }
@@ -1046,6 +1106,33 @@ def applyRoomPageEdits() {
     }
 }
 
+/** Renaming a room changes its setting keys. Move saved values onto the new name. */
+def migrateRoomSettings(String oldName, String newName) {
+    if (!oldName || !newName) return
+    if (normalizeLabel(oldName) == normalizeLabel(newName)) return
+    def oldKey = roomOverrideKey(oldName)
+    def newKey = roomOverrideKey(newName)
+    def overrides = new LinkedHashMap(state.aliasOverrides ?: [:])
+    if (oldKey && newKey && overrides.containsKey(oldKey) && !overrides.containsKey(newKey)) {
+        overrides[newKey] = overrides.remove(oldKey)
+        state.aliasOverrides = overrides
+    }
+    copySetting(roomIncludeSettingName(oldName), roomIncludeSettingName(newName), "bool")
+    copySetting(roomAliasSettingName(oldName), roomAliasSettingName(newName), "text")
+    copySetting(roomNameSettingName(oldName), roomNameSettingName(newName), "text")
+    copySetting(sortRoomSettingName(oldName), sortRoomSettingName(newName), "bool")
+    copySetting(sortTargetSettingName(oldName), sortTargetSettingName(newName), "enum")
+}
+
+def copySetting(String oldName, String newName, String type) {
+    if (!oldName || !newName || oldName == newName) return
+    def value = settings[oldName]
+    if (value == null) return
+    try {
+        app.updateSetting(newName, [type: type, value: value])
+    } catch (Exception ignored) { }
+}
+
 /** Stable identity-based key is checked first; legacy index-based key is a one-time migration fallback. */
 boolean roomIncludeValue(idx, room = null) {
     if (room != null) {
@@ -1060,7 +1147,7 @@ boolean roomIncludeValue(idx, room = null) {
 
 def applySortRoomIncludes() {
     def order = state.sortRoomOrder ?: []
-    def map = (state.sortRoomInclude ?: [:]) as Map
+    def map = new LinkedHashMap(state.sortRoomInclude ?: [:])
     order.each { roomName ->
         def key = normalizeLabel(roomName)
         def settingName = sortRoomSettingName(roomName)
@@ -1099,7 +1186,7 @@ List availableSortRooms() {
     def rooms = (state.hubRooms ?: []) + (state.roomPlan ?: []).findAll { it.hubRoomId }.collect {
         [id: it.hubRoomId, name: it.canonicalName]
     }
-    rooms.unique { it.id }.sort { it.name?.toLowerCase() }
+    rooms.unique { it.id?.toString() }.sort { it.name?.toLowerCase() }
 }
 
 Map sortTargetRoomOptions() {
@@ -1131,17 +1218,28 @@ String defaultSortTarget(String roomName, List devices = null) {
 
 def applySortRoomTargets() {
     def order = state.sortRoomOrder ?: []
-    def map = (state.sortRoomTarget ?: [:]) as Map
+    def map = new LinkedHashMap(state.sortRoomTarget ?: [:])
     def matches = (state.matchPreview ?: []).findAll { it.proposedRoomKey }
     def byRoom = matches.groupBy { it.proposedRoomName }
+    def skip = sortTargetSkipValue()
     order.each { roomName ->
         def key = normalizeLabel(roomName)
-        def setting = settings[sortTargetSettingName(roomName)]
-        if (setting != null) {
-            map[key] = setting.toString()
+        def settingName = sortTargetSettingName(roomName)
+        def setting = settings[settingName]
+        def chosen
+        // "__skip__" means the room did not exist yet. Once it does, follow the
+        // room instead of leaving every device skipped. Uncheck the room to skip it.
+        if (setting != null && setting.toString() != skip) {
+            chosen = setting.toString()
         } else {
-            map[key] = defaultSortTarget(roomName, byRoom[roomName] ?: [])
+            chosen = defaultSortTarget(roomName, byRoom[roomName] ?: [])
+            if (chosen != skip && setting?.toString() == skip) {
+                try {
+                    app.updateSetting(settingName, [type: "enum", value: chosen])
+                } catch (Exception ignored) { }
+            }
         }
+        map[key] = chosen
     }
     state.sortRoomTarget = map
 }
@@ -1245,11 +1343,17 @@ def handleAddRoomButton() {
 }
 
 def handleAddLeftovers() {
-    if (!leftoverRoomId || !leftoverDeviceIds) return
-    def manual = state.manualAssignments ?: [:]
+    if (!leftoverRoomId || !leftoverDeviceIds) {
+        state.lastLeftoverOk = false
+        state.lastLeftoverMessage = "Pick a target room and at least one device, then tap Add to plan."
+        return
+    }
+    def manual = new LinkedHashMap(state.manualAssignments ?: [:])
     def ids = leftoverDeviceIds instanceof Collection ? leftoverDeviceIds : [leftoverDeviceIds]
     ids.each { id -> manual[id.toString()] = leftoverRoomId.toString() }
     state.manualAssignments = manual
+    state.lastLeftoverOk = true
+    state.lastLeftoverMessage = "Queued ${ids.size()} device(s). They are assigned when you Sort on Step 2."
 }
 
 // ---------------------------------------------------------------------------
@@ -1297,7 +1401,7 @@ def handleCreateRooms() {
             return
         }
         try {
-            def resp = createRoom(room.canonicalName)
+            def resp = createRoom(room.canonicalName, liveRooms)
             def newId = resp?.roomId
             if (newId) {
                 room.hubRoomId = newId as Long
@@ -1345,6 +1449,11 @@ def handleSortDevices() {
         logWarn "Sort refused: already in progress"
         return
     }
+    if (state.undoInProgress) {
+        state.lastRunLog = ["Undo is still running."]
+        logWarn "Sort refused: undo in progress"
+        return
+    }
     if (!writeProbeOk()) {
         state.lastRunLog = ["Write probe failed. Aborting sort."]
         logError "Sort aborted: write probe failed"
@@ -1375,33 +1484,141 @@ def handleSortDevices() {
     state.lastRun = [
         started: now(),
         undo: undo,
-        createdRoomIds: state.lastCreatedRoomIds ?: []
+        createdRoomIds: new ArrayList(state.lastCreatedRoomIds ?: [])
     ]
+    // The ids now belong to this run. A later sort must not undo-delete them.
+    state.lastCreatedRoomIds = []
+    state.applyBulkFailedRooms = []
     state.applyInProgress = true
     state.applyStartedAt = now()
+    state.applyHeartbeat = state.applyStartedAt
     state.applyProgress = "Queued ${queue.size()} device(s)"
     logInfo "Sort queued ${queue.size()} device(s)"
-    runIn(1, "applyNextBatch")
+    // Commit the lock before arming the timer. state itself is saved only
+    // when this click finishes, and Step 2's render often outlasts runIn(1).
+    commitApplyFields()
+    try {
+        runIn(1, "applyNextBatch")
+    } catch (Exception e) {
+        logError "Could not schedule sort: ${e.message}"
+        finishApply("Failed to schedule sort: ${e.message}")
+    }
+}
+
+int applyDeviceChunkSize() { 25 }
+
+long applyStaleMillis() { 2 * 60 * 1000 }
+
+boolean bulkAlreadyFailed(Long roomId) {
+    if (roomId == null) return false
+    (state.applyBulkFailedRooms ?: []).any { it?.toString() == roomId.toString() }
+}
+
+def markBulkFailed(Long roomId) {
+    def ids = [] as LinkedHashSet
+    (state.applyBulkFailedRooms ?: []).each { if (it != null) ids << it.toString() }
+    if (roomId != null) ids << roomId.toString()
+    state.applyBulkFailedRooms = ids as List
+}
+
+/** True when a sort lock has had no heartbeat for longer than the idle window. */
+boolean applyLockStale(Object activityAt, long nowMs, long staleMillis) {
+    if (activityAt == null) return false
+    try {
+        return (nowMs - (activityAt as Long)) > staleMillis
+    } catch (Exception ignored) {
+        return false
+    }
+}
+
+/**
+ * One scheduler wake's slice of the sort queue.
+ * Leading skip rows are returned in skips. batch is the next room: every
+ * device still queued for that room when wholeRoom is true, otherwise at
+ * most chunkSize of them. Everything else stays in remaining, in order.
+ */
+Map splitApplyQueue(List queue, int chunkSize, boolean wholeRoom) {
+    def items = []
+    (queue ?: []).each { items << it }
+    def skips = []
+    while (items && items[0]?.skip) {
+        skips << items.remove(0)
+    }
+    if (!items) return [skips: skips, batch: [], remaining: []]
+    def roomId = items[0]?.roomId
+    def batch = []
+    def remaining = []
+    def limit = wholeRoom ? Integer.MAX_VALUE : Math.max(chunkSize, 1)
+    items.each { item ->
+        def sameRoom = item?.roomId != null && roomId != null && item.roomId.toString() == roomId.toString()
+        if (sameRoom && !item.skip && batch.size() < limit) {
+            batch << item
+        } else {
+            remaining << item
+        }
+    }
+    [skips: skips, batch: batch, remaining: remaining]
+}
+
+/** state is written when the wake ends. Mirror the lock now so a timer that fires early can see it. */
+def commitApplyFields() {
+    try {
+        atomicState.applyInProgress = state.applyInProgress
+        atomicState.applyStartedAt = state.applyStartedAt
+        atomicState.applyHeartbeat = state.applyHeartbeat
+        atomicState.applyQueue = state.applyQueue
+        atomicState.applyProgress = state.applyProgress
+        atomicState.lastRunLog = state.lastRunLog
+        atomicState.lastRun = state.lastRun
+    } catch (Exception e) {
+        logWarn "Could not commit apply state: ${e.message}"
+    }
+}
+
+boolean hydrateApplyLock() {
+    if (state.applyInProgress) return true
+    try {
+        if (!atomicState.applyInProgress) return false
+        // This wake's state snapshot is older than the commit. Take the committed fields whole.
+        state.applyInProgress = true
+        state.applyQueue = atomicState.applyQueue
+        state.applyStartedAt = atomicState.applyStartedAt
+        state.applyHeartbeat = atomicState.applyHeartbeat
+        state.applyProgress = atomicState.applyProgress
+        state.lastRunLog = atomicState.lastRunLog
+        state.lastRun = atomicState.lastRun
+        logWarn "Sort batch recovered apply lock from the early commit"
+        return true
+    } catch (Exception ignored) {
+        return false
+    }
+}
+
+def touchApplyHeartbeat() {
+    state.applyHeartbeat = now()
 }
 
 def clearStaleApplyLock() {
     if (!state.applyInProgress) return
-    if (!state.applyStartedAt) return
-    if ((now() - (state.applyStartedAt as Long)) <= 5 * 60 * 1000) return
-    logWarn "Apply lock stale on page load; clearing"
+    def activity = state.applyHeartbeat ?: state.applyStartedAt
+    if (!applyLockStale(activity, now(), applyStaleMillis())) return
+    logWarn "Apply lock idle on page load; clearing"
     unschedule("applyNextBatch")
     state.applyQueue = []
     state.applyInProgress = false
     state.applyProgress = "Timed out / interrupted. Check Results log."
-    def logLines = state.lastRunLog ?: []
-    logLines << "TIMED OUT / interrupted"
+    def logLines = new ArrayList(state.lastRunLog ?: [])
+    logLines << "TIMED OUT / interrupted — no progress for ${applyStaleMillis().intdiv(60000)} min"
     state.lastRunLog = logLines
+    commitApplyFields()
 }
 
 def finishApply(String progressMessage) {
     state.applyQueue = []
     state.applyInProgress = false
     state.applyProgress = progressMessage
+    state.applyHeartbeat = now()
+    commitApplyFields()
     logInfo progressMessage
     try {
         refreshScanIntoState()
@@ -1411,66 +1628,58 @@ def finishApply(String progressMessage) {
 }
 
 def applyNextBatch() {
-    if (!state.applyInProgress) return
+    if (!hydrateApplyLock()) {
+        logWarn "Sort batch skipped: apply lock was not set"
+        return
+    }
     try {
-        // Stale lock
-        if (state.applyStartedAt && (now() - (state.applyStartedAt as Long)) > 5 * 60 * 1000) {
-            logWarn "Apply lock stale; clearing"
-            cancelApply()
-            state.applyProgress = "Timed out / interrupted. Check Results log."
-            return
-        }
-        def queue = (state.applyQueue ?: []) as List
-        if (!queue) {
-            finishApply("Done. ${(state.lastRunLog ?: []).size()} log line(s).")
-            return
-        }
-        def logLines = state.lastRunLog ?: []
-
-        // Drain skip entries first
-        while (queue && queue[0]?.skip) {
-            def item = queue.remove(0)
+        touchApplyHeartbeat()
+        def split = splitApplyQueue(state.applyQueue ?: [], applyDeviceChunkSize(), true)
+        def logLines = new ArrayList(state.lastRunLog ?: [])
+        split.skips.each { item ->
             logLines << "SKIP ${item.deviceName}: ${item.skip}"
             logWarn "Skip ${item.deviceName}: ${item.skip}"
         }
-        if (!queue) {
+        if (!split.batch) {
             state.lastRunLog = logLines
             finishApply("Done. ${logLines.size()} device(s) processed.")
             return
         }
 
-        // Process one room per tick via bulk membership replace (merged with existing devices)
-        def roomId = queue[0].roomId as Long
-        def roomName = queue[0].roomName
-        def batch = []
-        def remaining = []
-        queue.each { item ->
-            if (!item.skip && item.roomId != null && (item.roomId as Long) == roomId) {
-                batch << item
-            } else {
-                remaining << item
+        // One room per wake. Bulk POST replaces the room's whole membership,
+        // so the post includes every device still queued for that room.
+        // The queue is updated only after the write, so a killed wake retries.
+        def roomId = split.batch[0].roomId as Long
+        def roomName = split.batch[0].roomName
+        logDebug "Apply room ${roomName} (${roomId}): ${split.batch.size()} device(s); remaining ${split.remaining.size()}"
+        def assigned = false
+        if (bulkAlreadyFailed(roomId)) {
+            logDebug "Continuing per-device assign for ${roomName}"
+        } else {
+            assigned = bulkAssignDevicesToRoom(roomId, roomName, split.batch)
+            if (!assigned) {
+                markBulkFailed(roomId)
+                logWarn "Bulk assign failed for ${roomName}; falling back to per-device setRoom"
             }
         }
-        state.applyQueue = remaining
-        logDebug "Apply room ${roomName} (${roomId}): ${batch.size()} device(s); remaining ${remaining.size()}"
-
-        def assigned = bulkAssignDevicesToRoom(roomId, roomName, batch)
+        def queueAfter
         if (assigned) {
-            batch.each { item ->
+            split.batch.each { item ->
                 logLines << "OK ${item.deviceName} → ${roomName} (${roomId})"
                 logDebug "OK ${item.deviceName} → ${roomName} (${roomId})"
             }
+            queueAfter = split.remaining
         } else {
-            logWarn "Bulk assign failed for ${roomName}; falling back to per-device setRoom"
-            batch.each { item ->
+            def chunk = splitApplyQueue(split.batch, applyDeviceChunkSize(), false)
+            chunk.batch.each { item ->
                 try {
-                    def resp = setDeviceRoom(item.deviceId, item.roomId)
+                    def resp = setDeviceRoom(item.deviceId, roomId)
                     if (resp?.success) {
-                        logLines << "OK ${item.deviceName} → ${item.roomName} (${item.roomId})"
-                        logDebug "OK ${item.deviceName} → ${item.roomName} (${item.roomId})"
+                        logLines << "OK ${item.deviceName} → ${roomName} (${roomId})"
+                        logDebug "OK ${item.deviceName} → ${roomName} (${roomId})"
                     } else {
-                        logLines << "FAIL ${item.deviceName} → ${item.roomName}: ${resp}"
-                        logError "Fail ${item.deviceName} → ${item.roomName}: ${resp}"
+                        logLines << "FAIL ${item.deviceName} → ${roomName}: ${resp}"
+                        logError "Fail ${item.deviceName} → ${roomName}: ${resp}"
                     }
                 } catch (Exception e) {
                     logLines << "ERROR ${item.deviceName}: ${e.message}"
@@ -1478,18 +1687,24 @@ def applyNextBatch() {
                 }
                 pauseExecution(50)
             }
+            queueAfter = []
+            queueAfter.addAll(chunk.remaining ?: [])
+            queueAfter.addAll(split.remaining ?: [])
         }
 
         state.lastRunLog = logLines
-        state.applyProgress = "Processed ${logLines.size()} / approx remaining ${state.applyQueue.size()}"
-        if (state.applyQueue) {
+        state.applyQueue = queueAfter
+        state.applyProgress = "Processed ${logLines.size()} / ${queueAfter.size()} still queued"
+        touchApplyHeartbeat()
+        if (queueAfter) {
+            commitApplyFields()
             runIn(1, "applyNextBatch")
         } else {
             finishApply("Done. ${logLines.size()} device(s) processed.")
         }
     } catch (Exception e) {
         logError "Sort batch failed: ${e.message}"
-        def logLines = state.lastRunLog ?: []
+        def logLines = new ArrayList(state.lastRunLog ?: [])
         logLines << "ERROR sort batch: ${e.message}"
         state.lastRunLog = logLines
         finishApply("Failed: ${e.message}. Check Results log.")
@@ -1501,13 +1716,24 @@ def cancelApply() {
     state.applyQueue = []
     state.applyInProgress = false
     state.applyProgress = "Cancelled."
-    def logLines = state.lastRunLog ?: []
+    def logLines = new ArrayList(state.lastRunLog ?: [])
     logLines << "CANCELLED by user"
     state.lastRunLog = logLines
+    commitApplyFields()
     logWarn "Sort cancelled"
 }
 
 def handleUndo() {
+    if (state.applyInProgress) {
+        state.lastUndoLog = "A sort is still running. Cancel it or wait for it to finish."
+        logWarn "Undo refused: sort in progress"
+        return
+    }
+    if (state.undoInProgress) {
+        state.lastUndoLog = "Undo is already running."
+        logWarn "Undo refused: already in progress"
+        return
+    }
     def undo = state.lastRun?.undo
     if (!undo) {
         state.lastUndoLog = "Nothing to undo."
@@ -1519,36 +1745,152 @@ def handleUndo() {
         logError "Undo aborted: write probe failed"
         return
     }
-    def lines = []
-    logInfo "Undo starting for ${undo.size()} device(s)"
-    undo.each { entry ->
-        try {
-            def prior = entry.previousRoomId ?: 0
-            def resp = setDeviceRoom(entry.deviceId, prior as Long)
-            if (resp?.success) {
-                lines << "RESTORED device ${entry.deviceId} → room ${prior}"
-                logDebug "Restored device ${entry.deviceId} → room ${prior}"
-            } else {
-                lines << "FAIL device ${entry.deviceId}: ${resp}"
-                logError "Undo fail device ${entry.deviceId}: ${resp}"
-            }
-        } catch (Exception e) {
-            lines << "ERROR device ${entry.deviceId}: ${e.message}"
-            logError "Undo error device ${entry.deviceId}: ${e.message}"
-        }
-        pauseExecution(50)
+    state.undoQueue = new ArrayList(undo)
+    state.undoLog = []
+    state.undoDeleteRooms = undoDeleteCreatedRooms != false
+    state.undoInProgress = true
+    state.undoHeartbeat = now()
+    state.lastUndoLog = "Undo queued for ${undo.size()} device(s)."
+    logInfo "Undo queued for ${undo.size()} device(s)"
+    commitUndoFields()
+    try {
+        runIn(1, "applyUndoBatch")
+    } catch (Exception e) {
+        logError "Could not schedule undo: ${e.message}"
+        state.undoInProgress = false
+        state.lastUndoLog = "Failed to schedule undo: ${e.message}"
+        commitUndoFields()
     }
-    if (undoDeleteCreatedRooms) {
+}
+
+def commitUndoFields() {
+    try {
+        atomicState.undoInProgress = state.undoInProgress
+        atomicState.undoQueue = state.undoQueue
+        atomicState.undoLog = state.undoLog
+        atomicState.undoHeartbeat = state.undoHeartbeat
+        atomicState.undoDeleteRooms = state.undoDeleteRooms
+        atomicState.lastUndoLog = state.lastUndoLog
+        atomicState.lastRun = state.lastRun
+    } catch (Exception e) {
+        logWarn "Could not commit undo state: ${e.message}"
+    }
+}
+
+def clearStaleUndoLock() {
+    if (!state.undoInProgress) return
+    if (state.undoHeartbeat != null && !applyLockStale(state.undoHeartbeat, now(), applyStaleMillis())) return
+    logWarn "Undo lock idle on page load; clearing"
+    unschedule("applyUndoBatch")
+    state.undoInProgress = false
+    state.undoQueue = []
+    def lines = new ArrayList(state.undoLog ?: [])
+    lines << "TIMED OUT / interrupted — no progress for ${applyStaleMillis().intdiv(60000)} min"
+    state.undoLog = lines
+    state.lastUndoLog = lines.join("\n")
+    commitUndoFields()
+}
+
+def cancelUndo() {
+    unschedule("applyUndoBatch")
+    state.undoInProgress = false
+    state.undoQueue = []
+    def lines = new ArrayList(state.undoLog ?: [])
+    lines << "CANCELLED by user"
+    state.undoLog = lines
+    state.lastUndoLog = lines.join("\n")
+    commitUndoFields()
+    logWarn "Undo cancelled"
+}
+
+def applyUndoBatch() {
+    if (!state.undoInProgress) {
+        try {
+            if (!atomicState.undoInProgress) {
+                logWarn "Undo batch skipped: undo was not in progress"
+                return
+            }
+            state.undoInProgress = true
+            state.undoQueue = atomicState.undoQueue
+            state.undoLog = atomicState.undoLog
+            state.undoDeleteRooms = atomicState.undoDeleteRooms
+            state.undoHeartbeat = atomicState.undoHeartbeat
+            if (atomicState.lastRun) state.lastRun = atomicState.lastRun
+        } catch (Exception ignored) {
+            logWarn "Undo batch skipped: undo was not in progress"
+            return
+        }
+    }
+    try {
+        state.undoHeartbeat = now()
+        def queue = new ArrayList(state.undoQueue ?: [])
+        if (!queue) {
+            finishUndo()
+            return
+        }
+        def chunk = queue.take(applyDeviceChunkSize())
+        def rest = new ArrayList(queue.drop(applyDeviceChunkSize()))
+        def lines = new ArrayList(state.undoLog ?: [])
+        chunk.each { entry ->
+            try {
+                def prior = entry.previousRoomId ?: 0
+                def resp = setDeviceRoom(entry.deviceId, prior as Long)
+                if (resp?.success) {
+                    lines << "RESTORED device ${entry.deviceId} → room ${prior}"
+                    logDebug "Restored device ${entry.deviceId} → room ${prior}"
+                } else {
+                    lines << "FAIL device ${entry.deviceId}: ${resp}"
+                    logError "Undo fail device ${entry.deviceId}: ${resp}"
+                }
+            } catch (Exception e) {
+                lines << "ERROR device ${entry.deviceId}: ${e.message}"
+                logError "Undo error device ${entry.deviceId}: ${e.message}"
+            }
+            pauseExecution(50)
+        }
+        state.undoLog = lines
+        state.undoQueue = rest
+        state.lastUndoLog = lines.join("\n")
+        state.undoHeartbeat = now()
+        if (rest) {
+            commitUndoFields()
+            runIn(1, "applyUndoBatch")
+        } else {
+            finishUndo()
+        }
+    } catch (Exception e) {
+        logError "Undo batch failed: ${e.message}"
+        def lines = new ArrayList(state.undoLog ?: [])
+        lines << "ERROR undo batch: ${e.message}"
+        state.undoLog = lines
+        state.lastUndoLog = lines.join("\n")
+        state.undoInProgress = false
+        state.undoQueue = []
+        commitUndoFields()
+    }
+}
+
+def finishUndo() {
+    def lines = new ArrayList(state.undoLog ?: [])
+    if (state.undoDeleteRooms != false) {
         def created = state.lastRun?.createdRoomIds ?: []
-        def hubRooms = fetchHubRooms()
-        def devices = fetchAllDevices()
+        def hubRooms = []
+        def devices = []
+        try {
+            hubRooms = fetchHubRooms()
+            devices = fetchAllDevices()
+        } catch (Exception e) {
+            lines << "ERROR loading hub before room delete: ${e.message}"
+            logError "Undo room delete aborted: ${e.message}"
+            created = []
+        }
         created.each { rid ->
             def still = hubRooms.find { it.id as Long == rid as Long }
             if (!still) {
                 lines << "SKIP delete room ${rid}: already gone"
                 return
             }
-            def occupied = devices.any { (it.roomId as Long) == (rid as Long) }
+            def occupied = devices.any { it.roomId != null && (it.roomId as Long) == (rid as Long) }
             if (occupied) {
                 lines << "SKIP delete room ${still.name}: not empty"
             } else {
@@ -1563,10 +1905,19 @@ def handleUndo() {
             }
         }
     }
+    state.undoLog = lines
     state.lastUndoLog = lines.join("\n")
+    state.undoQueue = []
+    state.undoInProgress = false
     state.lastRun = null
+    state.lastCreatedRoomIds = []
+    commitUndoFields()
     logInfo "Undo finished: ${lines.size()} log line(s)"
-    refreshScanIntoState()
+    try {
+        refreshScanIntoState()
+    } catch (Exception e) {
+        logWarn "Post-undo scan refresh failed: ${e.message}"
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1916,8 +2267,8 @@ List findRoomNameCollisions(List plan, List hubRooms = null) {
     warnings
 }
 
-Map createRoom(String name) {
-    def live = fetchHubRooms()
+Map createRoom(String name, List knownRooms = null) {
+    def live = knownRooms != null ? knownRooms : fetchHubRooms()
     def decision = resolveRoomCreate(name, live)
     if (decision.action == "reuse") {
         logInfo "Not creating duplicate room '${name}'; reusing '${decision.name}' id=${decision.roomId}"
@@ -2023,12 +2374,17 @@ def hubGetJson(String path, Map query = null) {
 }
 
 String hubGetRaw(String path, Map query = null) {
+    hubGetRaw(path, query, false)
+}
+
+String hubGetRaw(String path, Map query, boolean retried) {
     ensureHubCookie()
     def params = [
         uri: "http://127.0.0.1:8080",
         path: path,
         contentType: "application/json",
         textParser: true,
+        timeout: hubHttpTimeoutSeconds(),
         headers: [:]
     ]
     if (query) params.query = query
@@ -2040,6 +2396,11 @@ String hubGetRaw(String path, Map query = null) {
             body = resp.data?.text ?: resp.data
         }
     } catch (Exception e) {
+        if (hubSecurity && !retried) {
+            logWarn "GET ${path} failed (${e.message}); retrying after hub login"
+            state.cookie = null
+            return hubGetRaw(path, query, true)
+        }
         logError "GET ${path} failed: ${e.message}"
         throw e
     }
@@ -2047,6 +2408,10 @@ String hubGetRaw(String path, Map query = null) {
 }
 
 Map hubPostJson(String path, Map bodyMap) {
+    hubPostJson(path, bodyMap, false)
+}
+
+Map hubPostJson(String path, Map bodyMap, boolean retried) {
     ensureHubCookie()
     def json = new groovy.json.JsonBuilder(bodyMap).toString()
     def params = [
@@ -2055,6 +2420,7 @@ Map hubPostJson(String path, Map bodyMap) {
         contentType: "application/json",
         requestContentType: "application/json",
         body: json,
+        timeout: hubHttpTimeoutSeconds(),
         headers: [:]
     ]
     if (state.cookie) params.headers.Cookie = state.cookie
@@ -2070,10 +2436,30 @@ Map hubPostJson(String path, Map bodyMap) {
             }
         }
     } catch (Exception e) {
+        if (hubSecurity && !retried) {
+            logWarn "POST ${path} failed (${e.message}); retrying after hub login"
+            state.cookie = null
+            return hubPostJson(path, bodyMap, true)
+        }
         logError "POST ${path} failed: ${e.message}"
         throw e
     }
     return result as Map
+}
+
+int hubHttpTimeoutSeconds() { 20 }
+
+def readSetCookie(resp) {
+    def headers = resp?.headers
+    if (!headers) return null
+    def raw = null
+    try {
+        raw = headers['Set-Cookie'] ?: headers['set-cookie']
+    } catch (Exception ignored) { }
+    if (raw instanceof Collection) raw = raw.find { it }
+    if (!raw) return null
+    def first = raw.toString().split(';')
+    first ? first[0] : null
 }
 
 def ensureHubCookie() {
@@ -2081,15 +2467,17 @@ def ensureHubCookie() {
         state.cookie = null
         return
     }
+    if (state.cookie) return
     try {
         logDebug "POST /login (hub security)"
         httpPost([
             uri: "http://127.0.0.1:8080",
             path: "/login",
             query: [loginRedirect: "/"],
+            timeout: hubHttpTimeoutSeconds(),
             body: [username: hubUsername, password: hubPassword, submit: "Login"]
         ]) { resp ->
-            state.cookie = resp?.headers?.'Set-Cookie'?.split(';')?.getAt(0)
+            state.cookie = readSetCookie(resp)
         }
         if (!state.cookie) {
             logWarn "Hub login did not return a session cookie"

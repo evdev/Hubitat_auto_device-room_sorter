@@ -8,6 +8,7 @@ import groovy.json.JsonSlurper
 import org.codehaus.groovy.control.CompilerConfiguration
 
 abstract class HubitatStubScript extends Script {
+    static Map capturedDefinition = [:]
     Map state = [:]
     Map atomicState = [:]
     Map settings = [:]
@@ -22,8 +23,12 @@ abstract class HubitatStubScript extends Script {
         error: { Object m -> System.err.println("ERROR: $m") }
     )
 
-    def definition(Map m) { }
+    def definition(Map m) { capturedDefinition.clear(); capturedDefinition.putAll(m) }
     def preferences(Closure c) { }
+    def now() { System.currentTimeMillis() }
+    def runIn(Object... args) { }
+    def unschedule(Object... args) { }
+    def pauseExecution(Object... args) { }
     def page(Object... args) { }
     def dynamicPage(Object... args) { }
     def section(Object... args) { }
@@ -424,6 +429,194 @@ assertTrue kitchenAdded != null, "adding a hub room name still puts it on the pl
 assertEq kitchenAdded.hubRoomId, 9L, "adding an existing hub name reuses that room id"
 assertTrue script.state.lastAddRoomMessage.toString().contains("already on the hub"),
     "add-room message says the hub room will be reused"
+
+assertEq HubitatStubScript.capturedDefinition.installOnOpen, true, "app installs on open so runIn works before Done"
+assertEq HubitatStubScript.capturedDefinition.singleThreaded, true, "sort and page refresh cannot overlap state writes"
+
+def kitchen = { id -> [deviceId: id, deviceName: "K${id}", roomId: 9L, roomName: "Kitchen"] }
+def bedroom = { id -> [deviceId: id, deviceName: "B${id}", roomId: 4L, roomName: "Bedroom"] }
+def whole = script.splitApplyQueue(
+    [kitchen(1), [deviceId: 2, deviceName: "skip me", roomId: null, skip: "no room id"], kitchen(3), bedroom(4)],
+    25,
+    true
+)
+assertEq whole.skips.collect { it.deviceId }, [], "a skip between room devices is not a leading skip"
+assertEq whole.batch.collect { it.deviceId }, [1, 3], "bulk slice keeps every device in the first room"
+assertEq whole.remaining.collect { it.deviceId }, [2, 4], "other rooms and mid-queue skips stay queued"
+
+def leading = script.splitApplyQueue(
+    [[deviceId: 8, deviceName: "x", skip: "no room id"], kitchen(1), kitchen(2)],
+    25,
+    true
+)
+assertEq leading.skips.collect { it.deviceId }, [8], "leading skips are drained before the room slice"
+assertEq leading.batch.collect { it.deviceId }, [1, 2], "room slice follows leading skips"
+
+def chunk = script.splitApplyQueue([kitchen(1), kitchen(2), kitchen(3), bedroom(4)], 2, false)
+assertEq chunk.batch.collect { it.deviceId }, [1, 2], "fallback slice caps the room"
+assertEq chunk.remaining.collect { it.deviceId }, [3, 4], "the rest of the room stays ahead of later rooms"
+
+long t0 = 5_000_000L
+assertTrue !script.applyLockStale(t0, t0 + 30_000L, script.applyStaleMillis()), "fresh heartbeat is not idle"
+assertTrue script.applyLockStale(t0, t0 + script.applyStaleMillis() + 1L, script.applyStaleMillis()), "idle heartbeat is stale"
+assertTrue !script.applyLockStale(null, t0, script.applyStaleMillis()), "missing heartbeat is not treated as stale"
+
+script.metaClass.now = { -> t0 }
+script.state.applyInProgress = true
+script.state.applyStartedAt = 0L
+script.state.applyHeartbeat = t0 - 1_000L
+script.state.applyQueue = [kitchen(1)]
+script.state.sortRoomOrder = ["sentinel"]
+script.state.lastProbeOk = true
+script.state.lastRunLog = []
+script.clearStaleApplyLock()
+assertEq script.state.applyInProgress, true, "an old start time does not cancel a sort that is still heartbeating"
+assertEq script.state.applyQueue.size(), 1, "live queue is left in place"
+script.previewPage()
+assertEq script.state.sortRoomOrder, ["sentinel"], "in-progress Step 2 does not rewrite sort state"
+
+script.state.applyHeartbeat = t0 - script.applyStaleMillis() - 1L
+script.clearStaleApplyLock()
+assertEq script.state.applyInProgress, false, "idle lock is cleared"
+assertEq script.state.applyProgress, "Timed out / interrupted. Check Results log.", "idle lock uses the timeout banner"
+assertTrue script.state.lastRunLog.any { it.toString().contains("TIMED OUT") }, "idle lock writes a timeout log line"
+assertTrue !script.state.lastRunLog.any { it.toString().contains("CANCELLED") }, "idle timeout is not recorded as a user cancel"
+assertEq script.atomicState.applyInProgress, false, "cleared lock is committed immediately"
+
+def scheduled = []
+script.metaClass.runIn = { long delay, String method -> scheduled << method }
+def bulkCalls = [0]
+script.metaClass.bulkAssignDevicesToRoom = { Long id, String name, List batch ->
+    bulkCalls[0] = bulkCalls[0] + 1
+    false
+}
+script.metaClass.setDeviceRoom = { deviceId, Long roomId -> [success: true] }
+script.metaClass.refreshScanIntoState = { -> }
+script.metaClass.applyDeviceChunkSize = { -> 2 }
+script.state.applyInProgress = true
+script.state.applyStartedAt = 0L
+script.state.applyHeartbeat = t0
+script.state.applyQueue = [kitchen(1), kitchen(2), kitchen(3), bedroom(4)]
+script.state.lastRunLog = []
+script.state.applyProgress = "Queued"
+script.atomicState.clear()
+script.applyNextBatch()
+assertEq script.state.lastRunLog.findAll { it.toString().startsWith("OK") }.size(), 2, "fallback assigns one chunk"
+assertEq script.state.applyQueue.collect { it.deviceId }, [3, 4], "unassigned devices stay queued after a failed bulk post"
+assertEq script.state.applyInProgress, true, "a long sort is not aborted for exceeding five minutes"
+assertTrue !script.state.lastRunLog.any { it.toString().contains("CANCELLED") }, "an old start time is not a user cancel"
+assertEq scheduled, ["applyNextBatch"], "the rest of the queue is scheduled"
+assertEq script.atomicState.applyInProgress, true, "continued sort commits the lock before returning"
+assertEq bulkCalls[0], 1, "the first wake tries bulk assign once"
+def failedRooms = script.state.applyBulkFailedRooms ?: []
+assertTrue failedRooms.any { it.toString() == "9" }, "a failed bulk room is remembered"
+scheduled.clear()
+script.applyNextBatch()
+assertEq bulkCalls[0], 1, "later wakes for that room do not bulk-assign again"
+assertEq script.state.applyQueue.collect { it.deviceId }, [4], "per-device fallback continues with the next room"
+
+scheduled.clear()
+script.state.clear()
+script.state.applyInProgress = false
+script.state.applyQueue = []
+script.state.lastRunLog = ["stale"]
+script.atomicState.clear()
+script.atomicState.applyInProgress = true
+script.atomicState.applyQueue = [bedroom(4)]
+script.atomicState.applyStartedAt = t0
+script.atomicState.applyHeartbeat = t0
+script.atomicState.lastRunLog = []
+script.atomicState.lastRun = [undo: []]
+script.metaClass.bulkAssignDevicesToRoom = { Long id, String name, List batch -> true }
+script.applyNextBatch()
+assertEq script.state.lastRunLog.collect { it.toString() }, ["OK B4 → Bedroom (4)"], "early commit is enough for the worker to run"
+assertEq script.state.applyInProgress, false, "recovered sort finishes"
+assertEq script.state.applyProgress.toString().startsWith("Done."), true, "recovered sort reports done"
+
+def scheduleEvents = []
+script.metaClass.writeProbeOk = { -> true }
+script.metaClass.refreshScanIntoState = { -> }
+script.metaClass.commitApplyFields = { -> scheduleEvents << "commit:${script.state.applyInProgress}" }
+script.metaClass.runIn = { long delay, String method -> scheduleEvents << "runIn:${method}" }
+script.state.clear()
+script.state.matchPreview = []
+script.state.lastCreatedRoomIds = [7L, 8L]
+script.settings.acknowledgedRisk = true
+script.handleSortDevices()
+assertEq scheduleEvents, ["commit:true", "runIn:applyNextBatch"], "the lock is committed before the timer is armed"
+assertEq script.state.applyInProgress, true, "sort sets the lock"
+assertTrue script.state.applyHeartbeat != null, "sort starts the idle clock"
+assertEq script.state.lastRun.createdRoomIds, [7L, 8L], "this sort remembers the rooms it may undo-delete"
+assertEq script.state.lastCreatedRoomIds, [], "those room ids are not reused by the next sort"
+
+script.state.sortRoomOrder = ["Gym"]
+script.state.sortRoomTarget = [:]
+script.state.matchPreview = [[proposedRoomKey: "Gym", proposedRoomName: "Gym", proposedRoomId: 4L, deviceId: 1L, deviceName: "Gym Light"]]
+script.state.roomPlan = [[canonicalName: "Gym", hubRoomId: 4L]]
+script.state.hubRooms = [[id: 4L, name: "Gym"]]
+script.settings["sortTarget_gym"] = "__skip__"
+script.applySortRoomTargets()
+assertEq script.state.sortRoomTarget["gym"], "4", "skip is dropped once the suggested room exists"
+assertEq script.settings["sortTarget_gym"], "4", "the target dropdown is updated to the created room"
+
+script.state.roomPlan = [[canonicalName: "Gym", hubRoomId: null, include: true, aliases: ["Gym", "workout"]]]
+script.state.aliasOverrides = [:]
+script.state.hubRooms = []
+script.settings["roomAlias_gym"] = "Gym, workout"
+script.settings["roomInclude_gym"] = false
+script.settings["roomName_gym"] = "Home Gym"
+script.applyRoomPageEdits()
+def renamed = script.state.roomPlan.find { script.normalizeLabel(it.canonicalName) == "home gym" }
+assertTrue renamed != null, "renamed room stays on the plan"
+assertEq renamed.include, false, "rename keeps the create checkbox"
+assertEq script.state.aliasOverrides["home gym"], "Gym, workout", "rename moves alias overrides"
+assertEq script.settings["roomInclude_home_gym"], false, "rename copies the include setting"
+
+def previousManual = ["9": "1"]
+script.state.manualAssignments = previousManual
+script.settings.leftoverRoomId = "2"
+script.settings.leftoverDeviceIds = ["10"]
+script.handleAddLeftovers()
+assertEq script.state.manualAssignments["9"], "1", "earlier manual assignments are kept"
+assertEq script.state.manualAssignments["10"], "2", "new manual assignment is stored"
+assertTrue !previousManual.is(script.state.manualAssignments), "manual assignments are saved as a new map"
+script.settings.leftoverRoomId = null
+script.settings.leftoverDeviceIds = null
+script.handleAddLeftovers()
+assertEq script.state.lastLeftoverOk, false, "Add to plan explains a missing selection"
+
+script.settings.hubSecurity = true
+script.state.cookie = "JSESSIONID=abc"
+script.ensureHubCookie()
+assertEq script.state.cookie, "JSESSIONID=abc", "hub login cookie is reused"
+script.settings.hubSecurity = false
+script.ensureHubCookie()
+assertEq script.state.cookie, null, "cookie is cleared when hub security is off"
+
+def roomFetches = [0]
+script.metaClass.fetchHubRooms = { -> roomFetches[0]++; [[id: 1L, name: "Office"]] }
+def reusedKnown = script.createRoom("Office", [[id: 1L, name: "Office"]])
+assertEq roomFetches[0], 0, "createRoom does not refetch when the caller already has the room list"
+assertEq reusedKnown.reused, true, "createRoom reuses a room from the provided list"
+
+script.metaClass.setDeviceRoom = { deviceId, Long roomId -> [success: true] }
+script.metaClass.refreshScanIntoState = { -> }
+script.metaClass.writeProbeOk = { -> true }
+def undoRuns = []
+script.metaClass.runIn = { long delay, String method -> undoRuns << method }
+script.settings.undoDeleteCreatedRooms = false
+script.settings.acknowledgedRisk = true
+script.state.applyInProgress = false
+script.state.undoInProgress = false
+script.state.lastRun = [undo: [[deviceId: 5L, previousRoomId: 0], [deviceId: 6L, previousRoomId: 3L]], createdRoomIds: [9L]]
+script.handleUndo()
+assertEq undoRuns, ["applyUndoBatch"], "undo schedules itself instead of restoring every device inline"
+assertEq script.state.undoQueue.collect { it.deviceId }, [5L, 6L], "undo queue holds the previous rooms"
+script.applyUndoBatch()
+assertEq script.state.undoInProgress, false, "undo finishes"
+assertEq script.state.lastRun, null, "finished undo clears the one-level snapshot"
+assertTrue script.state.lastUndoLog.toString().contains("RESTORED device 5"), "undo restores the first device"
+assertTrue script.state.lastUndoLog.toString().contains("RESTORED device 6"), "undo restores the second device"
 
 println "Assertions: ${assertions}, failures: ${failures}"
 if (failures > 0) System.exit(1)
